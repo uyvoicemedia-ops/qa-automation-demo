@@ -32,7 +32,7 @@ from playwright.sync_api import sync_playwright
 JIRA_BASE         = "https://i6group.atlassian.net"
 JIRA_EMAIL        = os.environ["JIRA_EMAIL"]
 JIRA_TOKEN        = os.environ["JIRA_TOKEN"]
-JIRA_ASSIGNEE_ID  = "6396fe9ab1082c30bb9168a4"
+JIRA_ASSIGNEE_ID  = "712020:7020c162-2bc4-4df1-8436-a71e505ce0bc"
 SLACK_BOT_TOKEN   = os.environ.get("SLACK_BOT_TOKEN", "")   # optional
 SLACK_DM_CHANNEL  = "D0BG5DM15PF"
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
