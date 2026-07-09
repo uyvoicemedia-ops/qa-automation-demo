@@ -4,12 +4,12 @@ Nightly QA Workflow  —  scripts/nightly_qa/main.py
 Mirrors the 9-step workflow originally designed for Claude Cowork.
 
 Env vars required (set as GitHub Secrets):
-  JIRA_EMAIL, JIRA_TOKEN, ANTHROPIC_API_KEY, SLACK_BOT_TOKEN,
-  GITHUB_TOKEN, QA_DEFAULT_USERNAME, QA_DEFAULT_PASSWORD,
-  GMAIL_USER, GMAIL_APP_PASSWORD
+  JIRA_EMAIL, JIRA_TOKEN, ANTHROPIC_API_KEY,
+  GITHUB_TOKEN, QA_DEFAULT_USERNAME, QA_DEFAULT_PASSWORD
 
 Optional:
-  STAGING_URL  (defaults to https://qa-test-company.i6clouds.com/dp#/dashboard)
+  SLACK_BOT_TOKEN  (DM notification skipped if not set)
+  STAGING_URL      (defaults to https://qa-test-company.i6clouds.com/dp#/dashboard)
 """
 
 import json
@@ -68,7 +68,7 @@ def step0_dedup():
 # ─────────────────────────────────────────────────────────────────────────────
 def step1_get_ticket(processed_keys: set):
     jql = (
-        'project = F6 AND status = "Pending QA" '
+        'project = SCRUM AND status = "Pending QA" '
         f'AND assignee = "{JIRA_ASSIGNEE_ID}" '
         "ORDER BY created ASC"
     )
@@ -85,7 +85,7 @@ def step1_get_ticket(processed_keys: set):
     resp.raise_for_status()
     issues = resp.json().get("issues", [])
 
-    ticket = None
+    ticket   = None
     fallback = None
 
     for issue in issues:
@@ -184,7 +184,6 @@ def step3_checkout(branch: str) -> bool:
         print(f"[Step 3] git fetch failed: {r.stderr.strip()}")
         return False
 
-    # Try checkout existing remote branch; create local tracking branch if needed
     r = run(f"git checkout {branch}")
     if r.returncode != 0:
         r = run(f"git checkout -b {branch} origin/{branch}")
@@ -197,10 +196,9 @@ def step3_checkout(branch: str) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 4  —  Code analysis (skipped — AI disabled)
+# STEP 4  —  Code analysis via Claude Haiku
 # ─────────────────────────────────────────────────────────────────────────────
 def step4_analyse_code(branch: Optional[str]) -> tuple[str, list[str]]:
-    # Get list of changed files for reference (no AI analysis)
     diff_cmd = (
         f"git diff --name-only origin/main...{branch}"
         if branch
@@ -208,56 +206,141 @@ def step4_analyse_code(branch: Optional[str]) -> tuple[str, list[str]]:
     )
     result = subprocess.run(diff_cmd, shell=True, capture_output=True, text=True)
     changed_files = [f for f in result.stdout.strip().splitlines() if f]
-    print(f"[Step 4] Skipped AI analysis — {len(changed_files)} changed files noted.")
-    return "(AI analysis skipped)", changed_files
+
+    if not changed_files:
+        print("[Step 4] No changed files detected — skipping AI analysis.")
+        return "No code changes detected.", changed_files
+
+    # Read a sample of changed file contents (up to ~4000 chars total)
+    snippets    = []
+    total_chars = 0
+    for filepath in changed_files[:10]:
+        try:
+            content = Path(filepath).read_text(errors="replace")
+            snippet = content[:600]
+            snippets.append(f"### {filepath}\n{snippet}")
+            total_chars += len(snippet)
+            if total_chars > 4000:
+                break
+        except Exception:
+            snippets.append(f"### {filepath}\n(could not read file)")
+
+    code_context = "\n\n".join(snippets)
+
+    prompt = (
+        "You are a senior QA engineer reviewing code changes for a software release.\n\n"
+        f"The following files were changed in branch '{branch or 'unknown'}':\n"
+        f"{chr(10).join(f'- {f}' for f in changed_files)}\n\n"
+        "Here are snippets from the changed files:\n\n"
+        f"{code_context}\n\n"
+        "In 3-5 concise sentences, identify the highest-risk areas that a QA tester "
+        "should pay special attention to. Focus on: data mutations, auth/permission changes, "
+        "UI regressions, and any patterns that could cause silent failures."
+    )
+
+    try:
+        message = ai_client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=512,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        risk_summary = message.content[0].text.strip()
+        print(f"[Step 4] AI risk analysis complete — {len(changed_files)} file(s) reviewed.")
+    except Exception as exc:
+        risk_summary = f"AI analysis unavailable: {exc}"
+        print(f"[Step 4] AI analysis failed: {exc}")
+
+    return risk_summary, changed_files
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 5  —  Build template test plan from ticket description
+# STEP 5  —  Generate test plan via Claude Sonnet
 # ─────────────────────────────────────────────────────────────────────────────
 def step5_write_test_plan(ticket, risk_summary: str) -> list[dict]:
-    summary = ticket["fields"].get("summary", "")
+    summary    = ticket["fields"].get("summary", "")
+    description = ""
+    desc_field  = ticket["fields"].get("description")
+    if isinstance(desc_field, dict):
+        # Jira Document Format — extract plain text
+        for block in desc_field.get("content", []):
+            for inline in block.get("content", []):
+                if inline.get("type") == "text":
+                    description += inline.get("text", "") + " "
+    elif isinstance(desc_field, str):
+        description = desc_field
+    description = description.strip()[:1000]
 
-    # Build a standard template: happy path + 3 generic edge cases
-    test_cases = [
-        {
-            "id": "TC-001",
-            "title": f"Happy path — {summary[:70]}",
-            "preconditions": "User is logged in. Feature flag is enabled for the test company.",
-            "steps": "1. Navigate to the relevant section.\n2. Perform the primary action described in the ticket.\n3. Confirm the operation completes successfully.",
-            "expected_result": "The feature works as described in the ticket with no errors.",
-        },
-        {
-            "id": "TC-002",
-            "title": "Edge case — invalid or missing input",
-            "preconditions": "User is logged in.",
-            "steps": "1. Navigate to the relevant section.\n2. Attempt the action with invalid or empty input.\n3. Submit/confirm.",
-            "expected_result": "Appropriate validation error is shown. No data is corrupted.",
-        },
-        {
-            "id": "TC-003",
-            "title": "Edge case — boundary / large data",
-            "preconditions": "User is logged in.",
-            "steps": "1. Navigate to the relevant section.\n2. Attempt the action with maximum allowed input or a large file/dataset.\n3. Submit/confirm.",
-            "expected_result": "System handles boundary input gracefully without crash or timeout.",
-        },
-        {
-            "id": "TC-004",
-            "title": "Regression — existing related functionality unaffected",
-            "preconditions": "User is logged in.",
-            "steps": "1. Navigate to a feature that existed before this change.\n2. Perform a standard operation that overlaps with the changed code.\n3. Confirm outcome.",
-            "expected_result": "Pre-existing functionality behaves identically to before the change.",
-        },
-        {
-            "id": "TC-005",
-            "title": "Permission / feature flag — access control",
-            "preconditions": "Test with a user/company that does NOT have the relevant feature flag enabled.",
-            "steps": "1. Log in as a user without the feature enabled.\n2. Attempt to access or use the new feature.\n3. Observe result.",
-            "expected_result": "Feature is not accessible or is hidden for users without the flag.",
-        },
-    ]
+    prompt = (
+        "You are a senior QA engineer. Based on the ticket below, generate exactly 5 test cases.\n\n"
+        f"Ticket: {ticket['key']}\n"
+        f"Summary: {summary}\n"
+        f"Description: {description or '(no description provided)'}\n\n"
+        f"Risk analysis from code review:\n{risk_summary}\n\n"
+        "Return a JSON array of exactly 5 objects. Each object must have these keys:\n"
+        '  "id"              : string, e.g. "TC-001"\n'
+        '  "title"           : string, short test case name\n'
+        '  "preconditions"   : string, setup steps required before testing\n'
+        '  "steps"           : string, numbered steps separated by \\n\n'
+        '  "expected_result" : string, what should happen if the test passes\n\n'
+        "Cover: (1) happy path, (2) invalid input, (3) boundary/large data, "
+        "(4) regression on existing functionality, (5) permission/feature-flag check.\n"
+        "Return ONLY valid JSON — no markdown, no explanation."
+    )
 
-    print(f"[Step 5] Template test plan created — {len(test_cases)} test cases.")
+    try:
+        message = ai_client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=2048,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = message.content[0].text.strip()
+        # Strip optional markdown code fences
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        test_cases = json.loads(raw)
+        if not isinstance(test_cases, list):
+            raise ValueError("Expected a JSON array")
+        print(f"[Step 5] AI test plan created — {len(test_cases)} test cases.")
+    except Exception as exc:
+        print(f"[Step 5] AI test plan failed ({exc}), falling back to template.")
+        test_cases = [
+            {
+                "id": "TC-001",
+                "title": f"Happy path — {summary[:70]}",
+                "preconditions": "User is logged in. Feature flag is enabled for the test company.",
+                "steps": "1. Navigate to the relevant section.\n2. Perform the primary action described in the ticket.\n3. Confirm the operation completes successfully.",
+                "expected_result": "The feature works as described in the ticket with no errors.",
+            },
+            {
+                "id": "TC-002",
+                "title": "Edge case — invalid or missing input",
+                "preconditions": "User is logged in.",
+                "steps": "1. Navigate to the relevant section.\n2. Attempt the action with invalid or empty input.\n3. Submit/confirm.",
+                "expected_result": "Appropriate validation error is shown. No data is corrupted.",
+            },
+            {
+                "id": "TC-003",
+                "title": "Edge case — boundary / large data",
+                "preconditions": "User is logged in.",
+                "steps": "1. Navigate to the relevant section.\n2. Attempt the action with maximum allowed input or a large file/dataset.\n3. Submit/confirm.",
+                "expected_result": "System handles boundary input gracefully without crash or timeout.",
+            },
+            {
+                "id": "TC-004",
+                "title": "Regression — existing related functionality unaffected",
+                "preconditions": "User is logged in.",
+                "steps": "1. Navigate to a feature that existed before this change.\n2. Perform a standard operation that overlaps with the changed code.\n3. Confirm outcome.",
+                "expected_result": "Pre-existing functionality behaves identically to before the change.",
+            },
+            {
+                "id": "TC-005",
+                "title": "Permission / feature flag — access control",
+                "preconditions": "Test with a user/company that does NOT have the relevant feature flag enabled.",
+                "steps": "1. Log in as a user without the feature enabled.\n2. Attempt to access or use the new feature.\n3. Observe result.",
+                "expected_result": "Feature is not accessible or is hidden for users without the flag.",
+            },
+        ]
+
     return test_cases
 
 
@@ -272,13 +355,12 @@ def step6_create_excel(ticket_key: str, test_cases: list) -> tuple[Path, str]:
     ws = wb.active
     ws.title = "Test Cases"
 
-    HEADERS = [
+    HEADERS    = [
         "TC ID", "Title", "Preconditions", "Steps",
         "Expected Result", "Actual Result", "Status", "Notes", "Screenshot",
     ]
     COL_WIDTHS = [10, 35, 40, 65, 45, 40, 12, 30, 22]
 
-    # Header row
     header_fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
     header_font = Font(bold=True, color="FFFFFF", size=11)
     for col, (header, width) in enumerate(zip(HEADERS, COL_WIDTHS), 1):
@@ -289,7 +371,6 @@ def step6_create_excel(ticket_key: str, test_cases: list) -> tuple[Path, str]:
         ws.column_dimensions[openpyxl.utils.get_column_letter(col)].width = width
 
     ws.row_dimensions[1].height = 22
-
     alt_fill = PatternFill(start_color="DCE6F1", end_color="DCE6F1", fill_type="solid")
 
     for row_idx, tc in enumerate(test_cases, 2):
@@ -299,7 +380,7 @@ def step6_create_excel(ticket_key: str, test_cases: list) -> tuple[Path, str]:
             tc.get("preconditions", ""),
             tc.get("steps", ""),
             tc.get("expected_result", ""),
-            "",   # Actual Result  — filled after execution
+            "",   # Actual Result
             "",   # Status
             "",   # Notes
             "",   # Screenshot
@@ -327,8 +408,6 @@ def step7_execute_tc001(test_cases: list, ticket_key: str):
     if not test_cases:
         return "BLOCKED", "No test cases were generated.", "", screenshot_path, screenshot_filename
 
-    tc001 = test_cases[0]
-
     actual_result = ""
     status        = "BLOCKED"
     notes         = ""
@@ -342,11 +421,9 @@ def step7_execute_tc001(test_cases: list, ticket_key: str):
             )
             page = context.new_page()
 
-            # ── Navigate to staging ──────────────────────────────────────
             page.goto(STAGING_URL, timeout=30_000)
             page.wait_for_load_state("networkidle", timeout=20_000)
 
-            # ── Attempt login if credentials are available ────────────────
             if STAGING_USERNAME and STAGING_PASSWORD:
                 login_selectors = [
                     ("input[type='email']",    STAGING_USERNAME),
@@ -390,14 +467,12 @@ def step7_execute_tc001(test_cases: list, ticket_key: str):
                     except Exception:
                         pass
 
-            # ── Screenshot ───────────────────────────────────────────────
             page.screenshot(path=str(screenshot_path), full_page=False)
 
-            current_url  = page.url
-            page_title   = page.title()
+            current_url   = page.url
+            page_title    = page.title()
             actual_result = f"Navigated to: {current_url}\nPage title: {page_title}"
 
-            # ── Pass/Fail heuristic ───────────────────────────────────────
             if any(kw in current_url.lower() for kw in ("login", "sign-in", "signin", "auth")):
                 status = "BLOCKED"
                 notes  = (
@@ -418,7 +493,7 @@ def step7_execute_tc001(test_cases: list, ticket_key: str):
         actual_result = f"Timeout reaching staging URL: {exc}"
         status        = "BLOCKED"
         notes         = "Staging URL timed out — check network/VPN requirements."
-        screenshot_path.write_bytes(b"")          # placeholder
+        screenshot_path.write_bytes(b"")
 
     except Exception as exc:
         actual_result = f"Unexpected error: {exc}"
@@ -489,23 +564,22 @@ def step9c_slack(ticket, branch: Optional[str], tc001_status: str, excel_filenam
         print("[Step 9c] SLACK_BOT_TOKEN not set — skipping Slack notification.")
         return
 
-    emoji = {"PASS": "✅", "FAIL": "❌", "BLOCKED": "⚠️"}.get(tc001_status, "⚠️")
-    run_url = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
-    repo    = os.environ.get("GITHUB_REPOSITORY", "i6systems/in2plane-cloud")
-    run_id  = os.environ.get("GITHUB_RUN_ID", "")
+    emoji         = {"PASS": "✅", "FAIL": "❌", "BLOCKED": "⚠️"}.get(tc001_status, "⚠️")
+    run_url       = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+    repo          = os.environ.get("GITHUB_REPOSITORY", "")
+    run_id        = os.environ.get("GITHUB_RUN_ID", "")
     artifacts_url = f"{run_url}/{repo}/actions/runs/{run_id}" if run_id else "GitHub Actions"
 
     text = (
         f"*Nightly QA Run — {TODAY}*\n"
-        f"• *Ticket:* <https://i6group.atlassian.net/browse/{ticket['key']}|{ticket['key']}>"
+        f"• *Ticket:* <{JIRA_BASE}/browse/{ticket['key']}|{ticket['key']}>"
         f" — {ticket['fields']['summary']}\n"
         f"• *Branch:* `{branch or 'unknown'}`\n"
         f"• *TC-001:* {emoji} {tc001_status}\n"
         f"• *Excel + screenshot:* <{artifacts_url}|Download from GitHub Actions artifacts>"
         f" → `{excel_filename}`\n"
         f"\n"
-        f"💳 Token balance check: https://console.anthropic.com/settings/usage\n"
-        f"Check daily to avoid running out during personal use."
+        f"💳 Token balance check: https://console.anthropic.com/settings/usage"
     )
 
     resp = requests.post(
@@ -527,9 +601,9 @@ def main():
     sep = "=" * 62
     print(f"\n{sep}\n  Nightly QA Workflow — {TODAY}\n{sep}\n")
 
-    dedup_data, processed_keys = step0_dedup()
-    ticket                     = step1_get_ticket(processed_keys)
-    parent_key, branch         = step2_get_branch(ticket)
+    dedup_data, processed_keys  = step0_dedup()
+    ticket                      = step1_get_ticket(processed_keys)
+    parent_key, branch          = step2_get_branch(ticket)
 
     if branch:
         step3_checkout(branch)
