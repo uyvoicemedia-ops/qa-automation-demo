@@ -69,7 +69,6 @@ def step0_dedup():
 def step1_get_ticket(processed_keys: set):
     jql = (
         'project = SCRUM AND status = "Pending QA" '
-        f'AND assignee = "{JIRA_ASSIGNEE_ID}" '
         "ORDER BY created ASC"
     )
     resp = requests.post(
