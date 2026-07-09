@@ -101,8 +101,8 @@ def step1_get_ticket(processed_keys: set):
             print(f"[Step 1] All tickets previously processed — re-running oldest: {ticket['key']}")
 
     if ticket is None:
-        print("[Step 1] No Pending QA tickets found. Exiting.")
-        sys.exit(0)
+        print("[Step 1] No Pending QA tickets found.")
+        return None
 
     print(f"[Step 1] Selected: {ticket['key']} — {ticket['fields']['summary']}")
     return ticket
@@ -594,6 +594,221 @@ def step9c_slack(ticket, branch: Optional[str], tc001_status: str, excel_filenam
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# NO-TICKETS path  —  Board screenshot + Excel + Slack proof
+# ─────────────────────────────────────────────────────────────────────────────
+def take_board_screenshot() -> Optional[Path]:
+    """Fetch all SCRUM tickets via Jira API, render as HTML Kanban board, screenshot it."""
+    screenshot_path = OUTPUT_DIR / f"jira_board_{TODAY}.png"
+
+    # ── Fetch all tickets ─────────────────────────────────────────────────────
+    try:
+        resp = requests.post(
+            f"{JIRA_BASE}/rest/api/3/search/jql",
+            auth=jira_auth,
+            headers=jira_headers,
+            json={
+                "jql": "project = SCRUM ORDER BY created ASC",
+                "maxResults": 50,
+                "fields": ["summary", "status", "assignee", "key"],
+            },
+        )
+        resp.raise_for_status()
+        issues = resp.json().get("issues", [])
+    except Exception as exc:
+        print(f"[Board screenshot] Jira fetch failed: {exc}")
+        return None
+
+    # ── Group by status ───────────────────────────────────────────────────────
+    STATUS_ORDER = ["In Progress", "In Review", "Pending QA", "QA Testing", "Done"]
+    from collections import defaultdict, OrderedDict
+    columns: dict = OrderedDict()
+    for s in STATUS_ORDER:
+        columns[s] = []
+    for issue in issues:
+        status = issue["fields"]["status"]["name"]
+        if status not in columns:
+            columns[status] = []
+        assignee = (issue["fields"].get("assignee") or {}).get("displayName", "Unassigned")
+        columns[status].append({"key": issue["key"], "summary": issue["fields"]["summary"], "assignee": assignee})
+
+    # ── Build HTML board ──────────────────────────────────────────────────────
+    STATUS_COLORS = {
+        "In Progress":  ("#E3F2FD", "#1565C0"),
+        "In Review":    ("#FFF8E1", "#F57F17"),
+        "Pending QA":   ("#FCE4EC", "#C62828"),
+        "QA Testing":   ("#F3E5F5", "#6A1B9A"),
+        "Done":         ("#E8F5E9", "#2E7D32"),
+    }
+
+    cards_html = ""
+    for status, tickets in columns.items():
+        bg, fg = STATUS_COLORS.get(status, ("#F5F5F5", "#333"))
+        card_items = "".join(
+            f'<div style="background:#fff;border:1px solid #ddd;border-radius:6px;padding:10px 12px;'
+            f'margin-bottom:8px;box-shadow:0 1px 3px rgba(0,0,0,.08);">'
+            f'<div style="font-size:11px;color:#666;margin-bottom:4px;">{t["key"]}</div>'
+            f'<div style="font-size:13px;font-weight:600;color:#172B4D;line-height:1.4;">{t["summary"][:60]}</div>'
+            f'<div style="font-size:11px;color:#888;margin-top:6px;">👤 {t["assignee"]}</div>'
+            f'</div>'
+            for t in tickets
+        ) or '<div style="font-size:12px;color:#aaa;text-align:center;padding:16px;">Empty</div>'
+
+        count = len(tickets)
+        cards_html += (
+            f'<div style="min-width:220px;max-width:240px;background:{bg};border-radius:8px;padding:12px;">'
+            f'<div style="font-size:13px;font-weight:700;color:{fg};margin-bottom:10px;'
+            f'text-transform:uppercase;letter-spacing:.5px;">'
+            f'{status} <span style="background:{fg};color:#fff;border-radius:10px;padding:1px 8px;'
+            f'font-size:11px;">{count}</span></div>'
+            f'{card_items}'
+            f'</div>'
+        )
+
+    html = f"""<!DOCTYPE html><html><body style="margin:0;padding:24px;
+background:#F4F5F7;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
+<div style="margin-bottom:16px;">
+  <span style="font-size:20px;font-weight:700;color:#172B4D;">📋 SCRUM Board</span>
+  <span style="font-size:13px;color:#666;margin-left:12px;">Snapshot — {TODAY} (Nightly QA run)</span>
+</div>
+<div style="display:flex;gap:12px;align-items:flex-start;">{cards_html}</div>
+</body></html>"""
+
+    html_path = OUTPUT_DIR / f"board_{TODAY}.html"
+    html_path.write_text(html, encoding="utf-8")
+
+    # ── Playwright screenshot ─────────────────────────────────────────────────
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+            page    = browser.new_page(viewport={"width": 1400, "height": 800})
+            page.goto(f"file://{html_path.resolve()}")
+            page.wait_for_load_state("networkidle")
+            page.screenshot(path=str(screenshot_path), full_page=True)
+            browser.close()
+        print(f"[Board screenshot] Saved: {screenshot_path}")
+        return screenshot_path
+    except Exception as exc:
+        print(f"[Board screenshot] Playwright failed: {exc}")
+        return None
+
+
+def slack_upload_file(token: str, filepath: Path, channel: str, comment: str) -> bool:
+    """Upload a file to Slack using the current (post-2024) 3-step API."""
+    file_size = filepath.stat().st_size
+
+    # Step 1 — get upload URL
+    r1 = requests.post(
+        "https://slack.com/api/files.getUploadURLExternal",
+        headers={"Authorization": f"Bearer {token}"},
+        data={"filename": filepath.name, "length": file_size},
+    )
+    r1d = r1.json()
+    if not r1d.get("ok"):
+        print(f"[Slack upload] getUploadURLExternal: {r1d.get('error')}")
+        return False
+
+    # Step 2 — upload bytes
+    with open(filepath, "rb") as fh:
+        r2 = requests.post(r1d["upload_url"], data=fh)
+    if r2.status_code not in (200, 204):
+        print(f"[Slack upload] Upload PUT failed: {r2.status_code}")
+        return False
+
+    # Step 3 — complete & share in channel
+    r3 = requests.post(
+        "https://slack.com/api/files.completeUploadExternal",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        json={
+            "files":          [{"id": r1d["file_id"], "title": filepath.name}],
+            "channel_id":     channel,
+            "initial_comment": comment,
+        },
+    )
+    r3d = r3.json()
+    if r3d.get("ok"):
+        print(f"[Slack upload] '{filepath.name}' uploaded to Slack.")
+        return True
+    print(f"[Slack upload] completeUploadExternal: {r3d.get('error')}")
+    return False
+
+
+def no_tickets_excel() -> tuple[Path, str]:
+    filename = f"QA_NO_TICKETS_{TODAY}.xlsx"
+    filepath = OUTPUT_DIR / filename
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "QA Status"
+
+    header_fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
+    header_font = Font(bold=True, color="FFFFFF", size=11)
+
+    headers = ["Date", "Project", "Status", "Notes"]
+    widths  = [18, 20, 30, 60]
+    for col, (h, w) in enumerate(zip(headers, widths), 1):
+        cell = ws.cell(row=1, column=col, value=h)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        ws.column_dimensions[openpyxl.utils.get_column_letter(col)].width = w
+
+    green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+    for col, val in enumerate([
+        TODAY, "SCRUM", "✅ No Pending QA tickets",
+        "No tickets were found in 'Pending QA' status at the time of this nightly run. "
+        "All previously raised issues have been resolved or moved to another status.",
+    ], 1):
+        cell = ws.cell(row=2, column=col, value=val)
+        cell.fill = green_fill
+        cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+    ws.row_dimensions[2].height = 40
+    ws.freeze_panes = "A2"
+    wb.save(filepath)
+    print(f"[No-tickets] Excel created: {filepath}")
+    return filepath, filename
+
+
+def no_tickets_slack(excel_filename: str, board_screenshot: Optional[Path]):
+    token = os.environ.get("SLACK_BOT_TOKEN", "")
+    if not token:
+        print("[No-tickets] SLACK_BOT_TOKEN not set — skipping Slack notification.")
+        return
+
+    run_url       = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+    repo          = os.environ.get("GITHUB_REPOSITORY", "")
+    run_id        = os.environ.get("GITHUB_RUN_ID", "")
+    artifacts_url = f"{run_url}/{repo}/actions/runs/{run_id}" if run_id else "GitHub Actions"
+
+    text = (
+        f"*Nightly QA Run — {TODAY}*\n"
+        f"✅ *No Pending QA tickets found* — nothing to test tonight.\n"
+        f"• *Project:* SCRUM\n"
+        f"• *Checked at:* {datetime.now(timezone.utc).strftime('%H:%M UTC')}\n"
+        f"• *Proof Excel:* <{artifacts_url}|Download from GitHub Actions artifacts>"
+        f" → `{excel_filename}`"
+    )
+
+    resp = requests.post(
+        "https://slack.com/api/chat.postMessage",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        json={"channel": SLACK_DM_CHANNEL, "text": text, "mrkdwn": True},
+    )
+    data = resp.json()
+    if data.get("ok"):
+        print("[No-tickets] Slack DM sent.")
+    else:
+        print(f"[No-tickets] Slack error: {data.get('error')} — {data}")
+
+    # Upload board screenshot directly into the DM
+    if board_screenshot and board_screenshot.exists() and board_screenshot.stat().st_size > 0:
+        slack_upload_file(
+            token, board_screenshot, SLACK_DM_CHANNEL,
+            f"📋 Jira SCRUM board snapshot — {TODAY}"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
@@ -602,6 +817,16 @@ def main():
 
     dedup_data, processed_keys  = step0_dedup()
     ticket                      = step1_get_ticket(processed_keys)
+
+    # ── No tickets path ───────────────────────────────────────────────────────
+    if ticket is None:
+        board_screenshot      = take_board_screenshot()
+        _, excel_filename     = no_tickets_excel()
+        no_tickets_slack(excel_filename, board_screenshot)
+        print(f"\n{sep}\n  Done. No Pending QA tickets found.\n{sep}\n")
+        return
+
+    # ── Normal path ───────────────────────────────────────────────────────────
     parent_key, branch          = step2_get_branch(ticket)
 
     if branch:
