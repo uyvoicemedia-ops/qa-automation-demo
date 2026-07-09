@@ -1,0 +1,70 @@
+name: Nightly QA
+
+on:
+  schedule:
+    - cron: '0 1 * * *'   # 01:00 UTC daily  (02:00 BST / 03:00 CEST)
+  workflow_dispatch:       # Also triggerable manually from the Actions tab
+
+permissions:
+  contents: write          # Required to commit qa_processed_tickets.json back to main
+
+jobs:
+  nightly-qa:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # ── 1. Check out the repo with full history ──────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # Full git history needed for git diff comparisons
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── 2. Python setup ───────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: scripts/nightly_qa/requirements.txt
+
+      - name: Install Python dependencies
+        run: pip install -r scripts/nightly_qa/requirements.txt
+
+      - name: Install Playwright + Chromium
+        run: playwright install chromium --with-deps
+
+      # ── 3. Run the QA workflow ────────────────────────────────────────────
+      - name: Run nightly QA workflow
+        env:
+          JIRA_EMAIL:        ${{ secrets.JIRA_EMAIL }}
+          JIRA_TOKEN:        ${{ secrets.JIRA_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SLACK_BOT_TOKEN:   ${{ secrets.SLACK_BOT_TOKEN }}
+          STAGING_USERNAME:  ${{ secrets.QA_DEFAULT_USERNAME }}
+          STAGING_PASSWORD:  ${{ secrets.QA_DEFAULT_PASSWORD }}
+          GITHUB_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
+          STAGING_URL:       https://qa-test-company.i6clouds.com/dp#/dashboard
+
+        run: python scripts/nightly_qa/main.py
+
+      # ── 4. Upload Excel + screenshot as downloadable artifacts ────────────
+      - name: Upload QA artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qa-results-run-${{ github.run_number }}
+          path: qa_outputs/
+          retention-days: 30
+
+      # ── 5. Commit the updated dedup log back to main ──────────────────────
+      - name: Commit updated dedup log
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add qa_processed_tickets.json
+          # Only commit if the file actually changed
+          git diff --staged --quiet || git commit -m "chore: nightly QA dedup log [skip ci]"
+          git push
