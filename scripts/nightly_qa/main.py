@@ -67,42 +67,65 @@ def step0_dedup():
 # STEP 1  —  Fetch first unprocessed Pending QA ticket
 # ─────────────────────────────────────────────────────────────────────────────
 def step1_get_ticket(processed_keys: set):
-    jql = (
-        'project = SCRUM AND status = "Pending QA" '
-        "ORDER BY created ASC"
-    )
-    resp = requests.post(
+    # ── Diagnostic: log ALL SCRUM tickets + their real status names ───────────
+    diag_resp = requests.post(
         f"{JIRA_BASE}/rest/api/3/search/jql",
         auth=jira_auth,
         headers=jira_headers,
         json={
-            "jql": jql,
-            "maxResults": 20,
-            "fields": ["summary", "status", "parent", "description", "created"],
+            "jql": "project = SCRUM ORDER BY created ASC",
+            "maxResults": 50,
+            "fields": ["summary", "status"],
         },
     )
-    resp.raise_for_status()
-    issues = resp.json().get("issues", [])
+    if diag_resp.ok:
+        all_issues = diag_resp.json().get("issues", [])
+        print(f"[Step 1] All SCRUM tickets ({len(all_issues)} total):")
+        for i in all_issues:
+            print(f"  {i['key']} | status='{i['fields']['status']['name']}' | {i['fields']['summary'][:60]}")
+    else:
+        print(f"[Step 1] Diagnostic fetch failed: {diag_resp.status_code}")
+        all_issues = []
+
+    # ── Find first ticket whose status contains "pending" (case-insensitive) ──
+    PENDING_KEYWORDS = ["pending qa", "pending", "ready for qa", "qa pending", "awaiting qa"]
 
     ticket   = None
     fallback = None
 
-    for issue in issues:
-        if issue["key"] not in processed_keys:
-            ticket = issue
-            break
-        if fallback is None:
-            fallback = issue  # oldest already-processed ticket
+    for issue in all_issues:
+        status_lower = issue["fields"]["status"]["name"].lower()
+        if any(kw in status_lower for kw in PENDING_KEYWORDS):
+            if issue["key"] not in processed_keys:
+                ticket = issue
+                break
+            elif fallback is None:
+                fallback = issue
 
-    # If everything was processed before, re-process the oldest one
-    if ticket is None:
+    # If everything was processed, re-run the oldest matching ticket
+    if ticket is None and fallback is not None:
         ticket = fallback
-        if ticket:
-            print(f"[Step 1] All tickets previously processed — re-running oldest: {ticket['key']}")
+        print(f"[Step 1] All matching tickets previously processed — re-running: {ticket['key']}")
 
     if ticket is None:
-        print("[Step 1] No Pending QA tickets found.")
+        print("[Step 1] No Pending QA tickets found (checked all statuses above).")
         return None
+
+    # Re-fetch with full fields for the selected ticket
+    full_resp = requests.post(
+        f"{JIRA_BASE}/rest/api/3/search/jql",
+        auth=jira_auth,
+        headers=jira_headers,
+        json={
+            "jql": f"issue = {ticket['key']}",
+            "maxResults": 1,
+            "fields": ["summary", "status", "parent", "description", "created"],
+        },
+    )
+    if full_resp.ok:
+        full_issues = full_resp.json().get("issues", [])
+        if full_issues:
+            ticket = full_issues[0]
 
     print(f"[Step 1] Selected: {ticket['key']} — {ticket['fields']['summary']}")
     return ticket
@@ -694,7 +717,12 @@ background:#F4F5F7;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-
 
 def slack_upload_file(token: str, filepath: Path, channel: str, comment: str) -> bool:
     """Upload a file to Slack using the current (post-2024) 3-step API."""
+    if not filepath.exists() or filepath.stat().st_size == 0:
+        print(f"[Slack upload] File missing or empty: {filepath}")
+        return False
+
     file_size = filepath.stat().st_size
+    print(f"[Slack upload] Uploading '{filepath.name}' ({file_size} bytes)…")
 
     # Step 1 — get upload URL
     r1 = requests.post(
@@ -704,14 +732,19 @@ def slack_upload_file(token: str, filepath: Path, channel: str, comment: str) ->
     )
     r1d = r1.json()
     if not r1d.get("ok"):
-        print(f"[Slack upload] getUploadURLExternal: {r1d.get('error')}")
+        err = r1d.get("error", "unknown")
+        print(f"[Slack upload] getUploadURLExternal failed: {err}")
+        if err == "missing_scope":
+            print("[Slack upload] ⚠️  Your Slack bot is missing the 'files:write' scope.")
+            print("  Fix: go to api.slack.com/apps → OAuth & Permissions → Scopes → add 'files:write' → reinstall app.")
         return False
 
-    # Step 2 — upload bytes
+    # Step 2 — PUT file bytes to the presigned URL
     with open(filepath, "rb") as fh:
-        r2 = requests.post(r1d["upload_url"], data=fh)
+        r2 = requests.put(r1d["upload_url"], data=fh,
+                          headers={"Content-Type": "application/octet-stream"})
     if r2.status_code not in (200, 204):
-        print(f"[Slack upload] Upload PUT failed: {r2.status_code}")
+        print(f"[Slack upload] PUT to upload_url failed: HTTP {r2.status_code} — {r2.text[:200]}")
         return False
 
     # Step 3 — complete & share in channel
@@ -719,16 +752,16 @@ def slack_upload_file(token: str, filepath: Path, channel: str, comment: str) ->
         "https://slack.com/api/files.completeUploadExternal",
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
         json={
-            "files":          [{"id": r1d["file_id"], "title": filepath.name}],
-            "channel_id":     channel,
+            "files":           [{"id": r1d["file_id"], "title": filepath.stem}],
+            "channel_id":      channel,
             "initial_comment": comment,
         },
     )
     r3d = r3.json()
     if r3d.get("ok"):
-        print(f"[Slack upload] '{filepath.name}' uploaded to Slack.")
+        print(f"[Slack upload] ✅ '{filepath.name}' uploaded to Slack successfully.")
         return True
-    print(f"[Slack upload] completeUploadExternal: {r3d.get('error')}")
+    print(f"[Slack upload] completeUploadExternal failed: {r3d.get('error')} — {r3d}")
     return False
 
 
