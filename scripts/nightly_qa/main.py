@@ -29,7 +29,7 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
 # ── Config ───────────────────────────────────────────────────────────────────
-JIRA_BASE         = "https://i6group.atlassian.net"
+JIRA_BASE         = "https://claudeqa.atlassian.net"
 JIRA_EMAIL        = os.environ["JIRA_EMAIL"]
 JIRA_TOKEN        = os.environ["JIRA_TOKEN"]
 JIRA_ASSIGNEE_ID  = "712020:7020c162-2bc4-4df1-8436-a71e505ce0bc"
