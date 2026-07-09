@@ -72,14 +72,14 @@ def step1_get_ticket(processed_keys: set):
         f'AND assignee = "{JIRA_ASSIGNEE_ID}" '
         "ORDER BY created ASC"
     )
-    resp = requests.get(
-        f"{JIRA_BASE}/rest/api/3/search",
+    resp = requests.post(
+        f"{JIRA_BASE}/rest/api/3/search/jql",
         auth=jira_auth,
         headers=jira_headers,
-        params={
+        json={
             "jql": jql,
             "maxResults": 20,
-            "fields": "summary,status,parent,description,created",
+            "fields": ["summary", "status", "parent", "description", "created"],
         },
     )
     resp.raise_for_status()
