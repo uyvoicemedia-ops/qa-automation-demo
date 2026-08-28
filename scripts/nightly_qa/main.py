@@ -721,10 +721,23 @@ def step9c_slack(ticket, branch: Optional[str], tc001_status: str, excel_filenam
         f"💳 Token balance check: https://console.anthropic.com/settings/usage"
     )
 
+    # Open DM channel with the user first (required when posting to a user ID)
+    open_resp = requests.post(
+        "https://slack.com/api/conversations.open",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        json={"users": SLACK_DM_CHANNEL},
+    )
+    open_data = open_resp.json()
+    if not open_data.get("ok"):
+        print(f"[Step 9c] conversations.open failed: {open_data.get('error')} — {open_data}")
+        return
+    dm_channel = open_data["channel"]["id"]
+    print(f"[Step 9c] DM channel opened: {dm_channel}")
+
     resp = requests.post(
         "https://slack.com/api/chat.postMessage",
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        json={"channel": SLACK_DM_CHANNEL, "text": text, "mrkdwn": True},
+        json={"channel": dm_channel, "text": text, "mrkdwn": True},
     )
     data = resp.json()
     if data.get("ok"):
@@ -939,10 +952,22 @@ def no_tickets_slack(excel_filename: str, board_screenshot: Optional[Path]):
         f" → `{excel_filename}`"
     )
 
+    # Open DM channel with the user first
+    open_resp = requests.post(
+        "https://slack.com/api/conversations.open",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        json={"users": SLACK_DM_CHANNEL},
+    )
+    open_data = open_resp.json()
+    if not open_data.get("ok"):
+        print(f"[No-tickets] conversations.open failed: {open_data.get('error')}")
+        return
+    dm_channel = open_data["channel"]["id"]
+
     resp = requests.post(
         "https://slack.com/api/chat.postMessage",
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        json={"channel": SLACK_DM_CHANNEL, "text": text, "mrkdwn": True},
+        json={"channel": dm_channel, "text": text, "mrkdwn": True},
     )
     data = resp.json()
     if data.get("ok"):
@@ -953,7 +978,7 @@ def no_tickets_slack(excel_filename: str, board_screenshot: Optional[Path]):
     # Upload board screenshot directly into the DM
     if board_screenshot and board_screenshot.exists() and board_screenshot.stat().st_size > 0:
         slack_upload_file(
-            token, board_screenshot, SLACK_DM_CHANNEL,
+            token, board_screenshot, dm_channel,
             f"📋 Jira SCRUM board snapshot — {TODAY}"
         )
 
