@@ -468,7 +468,12 @@ def _ask_claude_vision(page, instruction: str, step_log: list) -> dict:
     try:
         msg = ai_client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=256,
+            max_tokens=300,
+            system=(
+                "You are a browser automation agent that outputs ONLY valid JSON. "
+                "Never write prose, explanations, or analysis. "
+                "Your entire response must be a single JSON object. No markdown, no text outside the JSON."
+            ),
             messages=[{
                 "role": "user",
                 "content": [
@@ -484,6 +489,10 @@ def _ask_claude_vision(page, instruction: str, step_log: list) -> dict:
             return {"action": "wait"}
         raw = re.sub(r"^```(?:json)?\s*", "", raw)
         raw = re.sub(r"\s*```$", "", raw)
+        raw = raw.strip()
+        if not raw:
+            step_log.append("Claude returned empty JSON block — retrying as wait")
+            return {"action": "wait"}
         result = json.loads(raw)
         step_log.append(f"Claude → {result}")
         return result
@@ -498,13 +507,14 @@ def step7_execute_tc001(test_cases: list, ticket_key: str):
     screenshot_path     = OUTPUT_DIR / screenshot_filename
 
     if not test_cases:
-        return "BLOCKED", "No test cases were generated.", "", screenshot_path, screenshot_filename
+        return "BLOCKED", "No test cases were generated.", "", screenshot_path, screenshot_filename, []
 
     tc        = test_cases[0]
     tc_steps  = tc.get("steps", "Navigate and verify the feature works as expected.")
     step_log  = []
     status    = "BLOCKED"
     notes     = ""
+    screenshots = []  # collect (label, path) tuples for Excel
 
     try:
         with sync_playwright() as p:
@@ -572,13 +582,22 @@ def step7_execute_tc001(test_cases: list, ticket_key: str):
                     return ("BLOCKED",
                             "\n".join(step_log),
                             "Login failed — verify QA_DEFAULT_USERNAME and QA_DEFAULT_PASSWORD secrets.",
-                            screenshot_path, screenshot_filename)
+                            screenshot_path, screenshot_filename, screenshots)
 
                 logged_in = True
                 print("[Step 7] Login succeeded.")
+                # Screenshot after login
+                ss = OUTPUT_DIR / f"ss_{ticket_key}_login.jpg"
+                page.screenshot(path=str(ss), type="jpeg", quality=70)
+                screenshots.append(("After Login", ss))
 
             # ── Phase 2: Execute TC-001 via Claude vision (coordinate-based) ──
             if logged_in:
+                # Screenshot BEFORE any test actions (initial dashboard state)
+                ss_before = OUTPUT_DIR / f"ss_{ticket_key}_before_test.jpg"
+                page.screenshot(path=str(ss_before), type="jpeg", quality=70)
+                screenshots.append(("Before Test (Dashboard)", ss_before))
+
                 test_instruction = (
                     f"You are a QA automation agent executing a test case on a web app.\n"
                     "The user is already logged in — the dashboard should be visible.\n\n"
@@ -586,7 +605,10 @@ def step7_execute_tc001(test_cases: list, ticket_key: str):
                     f"Steps:\n{tc_steps}\n\n"
                     "Use pixel COORDINATES to interact — look at the screenshot and identify "
                     "where to click or type. When done or if you can assess pass/fail, return done.\n"
-                    "If you still see a login page, return done with BLOCKED."
+                    "IMPORTANT: If you see a 'Service not available', 'Error', '503', '502', or any "
+                    "banner indicating the environment is down, immediately return:\n"
+                    '  {"action":"done","status":"BLOCKED","notes":"QA environment unavailable — service error banner detected"}\n'
+                    "If you still see a login page, return done with BLOCKED and note 'login page still visible'."
                 )
 
                 for i in range(15):
@@ -596,6 +618,10 @@ def step7_execute_tc001(test_cases: list, ticket_key: str):
                     if action["action"] == "done":
                         status = action.get("status", "BLOCKED")
                         notes  = action.get("notes", "")
+                        # Final screenshot
+                        ss = OUTPUT_DIR / f"ss_{ticket_key}_step{i+1}_done.jpg"
+                        page.screenshot(path=str(ss), type="jpeg", quality=70)
+                        screenshots.append((f"Step {i+1} — {status}", ss))
                         break
 
                     elif action["action"] == "click":
@@ -603,6 +629,10 @@ def step7_execute_tc001(test_cases: list, ticket_key: str):
                         try:
                             page.mouse.click(x, y)
                             page.wait_for_load_state("networkidle", timeout=10_000)
+                            # Screenshot after click
+                            ss = OUTPUT_DIR / f"ss_{ticket_key}_step{i+1}.jpg"
+                            page.screenshot(path=str(ss), type="jpeg", quality=70)
+                            screenshots.append((f"Step {i+1} after click", ss))
                         except Exception as e:
                             step_log.append(f"click({x},{y}) failed: {e}")
 
@@ -650,11 +680,11 @@ def step7_execute_tc001(test_cases: list, ticket_key: str):
             screenshot_path.write_bytes(b"")
 
     print(f"[Step 7] TC-001: {status} — {notes[:80]}")
-    return status, actual_result, notes, screenshot_path, screenshot_filename
+    return status, actual_result, notes, screenshot_path, screenshot_filename, screenshots
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 8  —  Update Excel with TC-001 results
+# STEP 8  —  Update Excel with TC-001 results + embedded screenshots
 # ─────────────────────────────────────────────────────────────────────────────
 def step8_update_excel(
     excel_path: Path,
@@ -662,7 +692,10 @@ def step8_update_excel(
     actual_result: str,
     notes: str,
     screenshot_filename: str,
+    screenshots: list,
 ):
+    from openpyxl.drawing.image import Image as XLImage
+
     colour_map = {
         "PASS":    ("C6EFCE", "276221"),
         "FAIL":    ("FFC7CE", "9C0006"),
@@ -681,8 +714,49 @@ def step8_update_excel(
     ws.cell(row=2, column=8, value=notes).alignment           = Alignment(wrap_text=True, vertical="top")
     ws.cell(row=2, column=9, value=screenshot_filename)
 
+    # ── Screenshots sheet ────────────────────────────────────────────────────
+    valid_shots = [(label, p) for label, p in screenshots
+                   if isinstance(p, Path) and p.exists() and p.stat().st_size > 0]
+
+    if valid_shots:
+        ws_ss = wb.create_sheet("Screenshots")
+        ws_ss.column_dimensions["A"].width = 25
+        ws_ss.column_dimensions["B"].width = 100  # image column
+
+        header_fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
+        header_font = Font(bold=True, color="FFFFFF", size=11)
+        for col, header in enumerate(["Label", "Screenshot"], 1):
+            cell = ws_ss.cell(row=1, column=col, value=header)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+        IMG_W    = 720   # display width in pixels (Excel units: 1px ≈ 0.75pt)
+        IMG_H    = 400   # display height
+        ROW_H_PT = 300   # row height in points (≈400px)
+
+        current_row = 2
+        for label, img_path in valid_shots:
+            try:
+                img = XLImage(str(img_path))
+                img.width  = IMG_W
+                img.height = IMG_H
+                ws_ss.cell(row=current_row, column=1, value=label).alignment = Alignment(
+                    wrap_text=True, vertical="top"
+                )
+                ws_ss.row_dimensions[current_row].height = ROW_H_PT
+                # Anchor to column B of this row
+                col_letter = openpyxl.utils.get_column_letter(2)
+                img.anchor = f"{col_letter}{current_row}"
+                ws_ss.add_image(img)
+                print(f"[Step 8] Embedded screenshot: {label} → {img_path.name}")
+            except Exception as exc:
+                ws_ss.cell(row=current_row, column=2, value=f"(could not embed: {exc})")
+                print(f"[Step 8] Could not embed {img_path}: {exc}")
+            current_row += 1
+
     wb.save(excel_path)
-    print("[Step 8] Excel updated with TC-001 results.")
+    print(f"[Step 8] Excel updated with TC-001 results + {len(valid_shots)} screenshot(s).")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1019,10 +1093,10 @@ def main():
     test_cases                  = step5_write_test_plan(ticket, risk_summary)
     excel_path, excel_filename  = step6_create_excel(ticket["key"], test_cases)
 
-    tc_status, actual_result, notes, screenshot_path, screenshot_filename = \
+    tc_status, actual_result, notes, screenshot_path, screenshot_filename, screenshots = \
         step7_execute_tc001(test_cases, ticket["key"])
 
-    step8_update_excel(excel_path, tc_status, actual_result, notes, screenshot_filename)
+    step8_update_excel(excel_path, tc_status, actual_result, notes, screenshot_filename, screenshots)
     step9a_update_dedup(dedup_data, ticket, excel_filename, tc_status)
     step9c_slack(ticket, branch, tc_status, excel_filename)
 
