@@ -436,19 +436,24 @@ def _screenshot_b64(page) -> str:
 def _ask_claude_vision(page, instruction: str, step_log: list) -> dict:
     """
     Send the current screenshot + instruction to Claude vision.
-    Returns a dict: {"action": "fill|click|wait|done", ...}
+    Claude returns coordinate-based actions (no CSS selectors needed).
+    Works on ANY page layout — adapts automatically to new features.
     """
     img_b64 = _screenshot_b64(page)
     prompt = (
         f"{instruction}\n\n"
-        "Look at the screenshot and return the NEXT single action as JSON only.\n"
+        "Look at the screenshot and return the NEXT single action as JSON.\n"
+        "Use SCREEN COORDINATES (x, y pixels) — NOT CSS selectors.\n"
+        "The screen is 1280 x 800 pixels.\n\n"
         "Valid actions:\n"
-        '  {"action":"fill","selector":"css_selector","value":"text_to_type"}\n'
-        '  {"action":"click","selector":"css_selector"}\n'
-        '  {"action":"wait"}   — page is loading, wait and retry\n'
-        '  {"action":"done","status":"PASS","notes":"what you observed"}\n'
-        '  {"action":"done","status":"FAIL","notes":"what went wrong"}\n'
-        '  {"action":"done","status":"BLOCKED","notes":"why blocked"}\n'
+        '  {"action":"click","x":640,"y":400}              — click at these pixel coords\n'
+        '  {"action":"type","text":"hello world"}           — type text into focused field\n'
+        '  {"action":"type_password"}                       — signals: type the real password here\n'
+        '  {"action":"key","key":"Enter"}                   — press keyboard key\n'
+        '  {"action":"wait"}                                — page still loading, wait\n'
+        '  {"action":"done","status":"PASS","notes":"..."}  — test passed\n'
+        '  {"action":"done","status":"FAIL","notes":"..."}  — test failed\n'
+        '  {"action":"done","status":"BLOCKED","notes":"..."} — cannot proceed\n'
         "Return ONLY valid JSON — no markdown, no explanation."
     )
     try:
@@ -558,21 +563,19 @@ def step7_execute_tc001(test_cases: list, ticket_key: str):
                 logged_in = True
                 print("[Step 7] Login succeeded.")
 
-            # ── Phase 2: Execute TC-001 via Claude vision ─────────────────────
+            # ── Phase 2: Execute TC-001 via Claude vision (coordinate-based) ──
             if logged_in:
                 test_instruction = (
                     f"You are a QA automation agent executing a test case on a web app.\n"
                     "The user is already logged in — the dashboard should be visible.\n\n"
                     f"TC-001: {tc.get('title', '')}\n"
                     f"Steps:\n{tc_steps}\n\n"
-                    "IMPORTANT RULES:\n"
-                    "- Use ONE simple CSS selector per action (no comma-separated lists)\n"
-                    "- For password fields use selector only — the code will inject the real password\n"
-                    "- When all steps are complete OR you can confirm pass/fail, return done\n"
-                    "- If you see a login page still, return done with BLOCKED"
+                    "Use pixel COORDINATES to interact — look at the screenshot and identify "
+                    "where to click or type. When done or if you can assess pass/fail, return done.\n"
+                    "If you still see a login page, return done with BLOCKED."
                 )
 
-                for i in range(12):
+                for i in range(15):
                     action = _ask_claude_vision(page, test_instruction, step_log)
                     print(f"[Step 7] Test step {i+1}: {action}")
 
@@ -581,23 +584,35 @@ def step7_execute_tc001(test_cases: list, ticket_key: str):
                         notes  = action.get("notes", "")
                         break
 
-                    elif action["action"] == "fill":
-                        sel = action.get("selector", "")
-                        val = QA_PASSWORD if "password" in sel.lower() else action.get("value", "")
-                        try:
-                            page.fill(sel, val, timeout=5_000)
-                        except Exception as e:
-                            step_log.append(f"fill failed ({sel}): {e}")
-
                     elif action["action"] == "click":
+                        x, y = action.get("x", 0), action.get("y", 0)
                         try:
-                            page.click(action.get("selector", ""), timeout=5_000)
+                            page.mouse.click(x, y)
                             page.wait_for_load_state("networkidle", timeout=10_000)
                         except Exception as e:
-                            step_log.append(f"click failed: {e}")
+                            step_log.append(f"click({x},{y}) failed: {e}")
+
+                    elif action["action"] == "type":
+                        try:
+                            page.keyboard.type(action.get("text", ""))
+                        except Exception as e:
+                            step_log.append(f"type failed: {e}")
+
+                    elif action["action"] == "type_password":
+                        try:
+                            page.keyboard.type(QA_PASSWORD)
+                        except Exception as e:
+                            step_log.append(f"type_password failed: {e}")
+
+                    elif action["action"] == "key":
+                        try:
+                            page.keyboard.press(action.get("key", "Enter"))
+                            page.wait_for_load_state("networkidle", timeout=10_000)
+                        except Exception as e:
+                            step_log.append(f"key failed: {e}")
 
                     elif action["action"] == "wait":
-                        page.wait_for_timeout(2_000)
+                        page.wait_for_timeout(3_000)
                 else:
                     status = "BLOCKED"
                     notes  = "Max steps reached without a conclusive result."
