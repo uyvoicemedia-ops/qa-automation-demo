@@ -496,85 +496,111 @@ def step7_execute_tc001(test_cases: list, ticket_key: str):
             page.goto(QA_URL, timeout=30_000)
             page.wait_for_load_state("networkidle", timeout=20_000)
 
-            # ── Phase 1: Login ────────────────────────────────────────────────
-            login_instruction = (
-                f"You are a QA automation agent logging into a web application.\n"
-                f"Username: {QA_USERNAME}\n"
-                f"Password: (fill the password field with the actual password — use selector only)\n\n"
-                "If you see a login form, fill the username/email field and password field, "
-                "then click the login/submit button.\n"
-                "If you are already logged in (dashboard visible), return done with PASS."
-            )
+            # ── Phase 1: Login (hardcoded — selectors confirmed from page) ────
+            logged_in = False
+            if QA_USERNAME and QA_PASSWORD:
+                username_selectors = [
+                    "#id_username", "#id_login", "#id_email",
+                    "input[name='username']", "input[name='email']",
+                    "input[type='text']", "input[type='email']",
+                ]
+                password_selectors = [
+                    "input[type='password']", "#id_password", "input[name='password']",
+                ]
+                submit_selectors = [
+                    "button[type='submit']", "input[type='submit']",
+                    "button:has-text('Login')", "button:has-text('Log in')",
+                    "button:has-text('Sign in')", ".login-btn", "#login-btn",
+                ]
 
-            for i in range(8):  # up to 8 login steps
-                action = _ask_claude_vision(page, login_instruction, step_log)
-                print(f"[Step 7] Login step {i+1}: {action}")
-
-                if action["action"] == "done":
-                    if action["status"] == "PASS":
-                        print("[Step 7] Claude confirmed: logged in.")
-                    else:
-                        status = action["status"]
-                        notes  = action.get("notes", "")
-                    break
-
-                elif action["action"] == "fill":
-                    sel = action.get("selector", "")
-                    val = action.get("value", "")
-                    # Substitute password placeholder if Claude used the username value for password
-                    if "password" in sel.lower() or action.get("field_type") == "password":
-                        val = QA_PASSWORD
+                for sel in username_selectors:
                     try:
-                        page.fill(sel, val, timeout=5_000)
-                    except Exception as e:
-                        step_log.append(f"fill failed ({sel}): {e}")
+                        page.fill(sel, QA_USERNAME, timeout=3_000)
+                        print(f"[Step 7] Username filled: {sel}")
+                        step_log.append(f"username filled via {sel}")
+                        break
+                    except Exception:
+                        pass
 
-                elif action["action"] == "click":
+                for sel in password_selectors:
                     try:
-                        page.click(action.get("selector", ""), timeout=5_000)
+                        page.fill(sel, QA_PASSWORD, timeout=3_000)
+                        print(f"[Step 7] Password filled: {sel}")
+                        step_log.append(f"password filled via {sel}")
+                        break
+                    except Exception:
+                        pass
+
+                for sel in submit_selectors:
+                    try:
+                        page.click(sel, timeout=3_000)
                         page.wait_for_load_state("networkidle", timeout=15_000)
-                    except Exception as e:
-                        step_log.append(f"click failed: {e}")
+                        print(f"[Step 7] Submit clicked: {sel}")
+                        step_log.append(f"submit clicked via {sel}")
+                        break
+                    except Exception:
+                        pass
 
-                elif action["action"] == "wait":
-                    page.wait_for_timeout(2_000)
+                # Verify login: check page no longer shows login form
+                page_text = page.inner_text("body")
+                login_still_visible = (
+                    "forgotten your password" in page_text.lower()
+                    or ("email/username" in page_text.lower() and QA_USERNAME not in page_text)
+                )
+                if login_still_visible:
+                    page.screenshot(path=str(screenshot_path), full_page=False)
+                    browser.close()
+                    return ("BLOCKED",
+                            "\n".join(step_log),
+                            "Login failed — verify QA_DEFAULT_USERNAME and QA_DEFAULT_PASSWORD secrets.",
+                            screenshot_path, screenshot_filename)
 
-            # ── Phase 2: Execute TC-001 steps ─────────────────────────────────
-            test_instruction = (
-                f"You are a QA automation agent executing this test case:\n\n"
-                f"TC-001: {tc.get('title', '')}\n"
-                f"Steps:\n{tc_steps}\n\n"
-                "Execute the next step. If all steps are complete, assess the result and return done."
-            )
+                logged_in = True
+                print("[Step 7] Login succeeded.")
 
-            for i in range(12):  # up to 12 test steps
-                action = _ask_claude_vision(page, test_instruction, step_log)
-                print(f"[Step 7] Test step {i+1}: {action}")
+            # ── Phase 2: Execute TC-001 via Claude vision ─────────────────────
+            if logged_in:
+                test_instruction = (
+                    f"You are a QA automation agent executing a test case on a web app.\n"
+                    "The user is already logged in — the dashboard should be visible.\n\n"
+                    f"TC-001: {tc.get('title', '')}\n"
+                    f"Steps:\n{tc_steps}\n\n"
+                    "IMPORTANT RULES:\n"
+                    "- Use ONE simple CSS selector per action (no comma-separated lists)\n"
+                    "- For password fields use selector only — the code will inject the real password\n"
+                    "- When all steps are complete OR you can confirm pass/fail, return done\n"
+                    "- If you see a login page still, return done with BLOCKED"
+                )
 
-                if action["action"] == "done":
-                    status = action.get("status", "BLOCKED")
-                    notes  = action.get("notes", "")
-                    break
+                for i in range(12):
+                    action = _ask_claude_vision(page, test_instruction, step_log)
+                    print(f"[Step 7] Test step {i+1}: {action}")
 
-                elif action["action"] == "fill":
-                    try:
-                        page.fill(action.get("selector", ""), action.get("value", ""), timeout=5_000)
-                    except Exception as e:
-                        step_log.append(f"fill failed: {e}")
+                    if action["action"] == "done":
+                        status = action.get("status", "BLOCKED")
+                        notes  = action.get("notes", "")
+                        break
 
-                elif action["action"] == "click":
-                    try:
-                        page.click(action.get("selector", ""), timeout=5_000)
-                        page.wait_for_load_state("networkidle", timeout=10_000)
-                    except Exception as e:
-                        step_log.append(f"click failed: {e}")
+                    elif action["action"] == "fill":
+                        sel = action.get("selector", "")
+                        val = QA_PASSWORD if "password" in sel.lower() else action.get("value", "")
+                        try:
+                            page.fill(sel, val, timeout=5_000)
+                        except Exception as e:
+                            step_log.append(f"fill failed ({sel}): {e}")
 
-                elif action["action"] == "wait":
-                    page.wait_for_timeout(2_000)
-            else:
-                # Loop exhausted without done
-                status = "BLOCKED"
-                notes  = "Max steps reached without a conclusive result."
+                    elif action["action"] == "click":
+                        try:
+                            page.click(action.get("selector", ""), timeout=5_000)
+                            page.wait_for_load_state("networkidle", timeout=10_000)
+                        except Exception as e:
+                            step_log.append(f"click failed: {e}")
+
+                    elif action["action"] == "wait":
+                        page.wait_for_timeout(2_000)
+                else:
+                    status = "BLOCKED"
+                    notes  = "Max steps reached without a conclusive result."
 
             # Final screenshot
             page.screenshot(path=str(screenshot_path), full_page=False)
