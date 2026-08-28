@@ -38,14 +38,15 @@ jobs:
       # ── 3. Run the QA workflow ────────────────────────────────────────────
       - name: Run nightly QA workflow
         env:
-          JIRA_EMAIL:        ${{ secrets.JIRA_EMAIL }}
-          JIRA_TOKEN:        ${{ secrets.JIRA_TOKEN }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          SLACK_BOT_TOKEN:   ${{ secrets.SLACK_BOT_TOKEN }}
-          STAGING_USERNAME:  ${{ secrets.QA_DEFAULT_USERNAME }}
-          STAGING_PASSWORD:  ${{ secrets.QA_DEFAULT_PASSWORD }}
-          GITHUB_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
-          STAGING_URL:       https://qa-test-company.i6clouds.com/dp#/dashboard
+          JIRA_EMAIL:              ${{ secrets.JIRA_EMAIL }}
+          JIRA_TOKEN:              ${{ secrets.JIRA_TOKEN }}
+          ANTHROPIC_API_KEY:       ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_WORKSPACE_ID:  ${{ secrets.ANTHROPIC_WORKSPACE_ID }}
+          SLACK_BOT_TOKEN:         ${{ secrets.SLACK_BOT_TOKEN }}
+          QA_DEFAULT_USERNAME:     ${{ secrets.QA_DEFAULT_USERNAME }}
+          QA_DEFAULT_PASSWORD:     ${{ secrets.QA_DEFAULT_PASSWORD }}
+          GITHUB_TOKEN:            ${{ secrets.GITHUB_TOKEN }}
+          QA_URL:                  https://qa-test-company.i6clouds.com/dp#/dashboard
 
         run: python scripts/nightly_qa/main.py
 
