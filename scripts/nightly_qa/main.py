@@ -35,7 +35,7 @@ JIRA_EMAIL        = os.environ["JIRA_EMAIL"]
 JIRA_TOKEN        = os.environ["JIRA_TOKEN"]
 JIRA_ASSIGNEE_ID  = "712020:7020c162-2bc4-4df1-8436-a71e505ce0bc"
 SLACK_BOT_TOKEN   = os.environ.get("SLACK_BOT_TOKEN", "")   # optional
-SLACK_DM_CHANNEL  = "D0BG5DM15PF"
+SLACK_DM_CHANNEL  = "U04FGQE0CD6"   # Yusuf's Slack user ID — bot will DM directly
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 GITHUB_TOKEN      = os.environ.get("GITHUB_TOKEN", "")
 QA_URL      = os.environ.get("QA_URL", "https://qa-test-company.i6clouds.com/dp#/dashboard")
@@ -303,14 +303,20 @@ def step5_write_test_plan(ticket, risk_summary: str) -> list[dict]:
         f"Summary: {summary}\n"
         f"Description: {description or '(no description provided)'}\n\n"
         f"Risk analysis from code review:\n{risk_summary}\n\n"
+        "IMPORTANT: All test cases must be executable through a WEB BROWSER UI.\n"
+        f"The QA environment URL is: {QA_URL}\n"
+        "Steps must describe actions a tester (or browser automation) can perform by clicking, "
+        "navigating, and interacting with elements visible on screen.\n"
+        "Do NOT generate test cases that require API calls, script execution, file system access, "
+        "or backend tools — only browser-based UI interactions.\n\n"
         "Return a JSON array of exactly 5 objects. Each object must have these keys:\n"
         '  "id"              : string, e.g. "TC-001"\n'
         '  "title"           : string, short test case name\n'
-        '  "preconditions"   : string, setup steps required before testing\n'
-        '  "steps"           : string, numbered steps separated by \\n\n'
-        '  "expected_result" : string, what should happen if the test passes\n\n'
-        "Cover: (1) happy path, (2) invalid input, (3) boundary/large data, "
-        "(4) regression on existing functionality, (5) permission/feature-flag check.\n"
+        '  "preconditions"   : string, e.g. "User is logged into the QA environment"\n'
+        '  "steps"           : string, numbered browser steps separated by \\n\n'
+        '  "expected_result" : string, what should be visible on screen if the test passes\n\n'
+        "Cover: (1) happy path, (2) invalid input, (3) UI edge case, "
+        "(4) regression on existing functionality, (5) permission/role check.\n"
         "Return ONLY valid JSON — no markdown, no explanation."
     )
 
