@@ -436,8 +436,10 @@ def step6_create_excel(ticket_key: str, test_cases: list) -> tuple[Path, str]:
 # ─────────────────────────────────────────────────────────────────────────────
 def _screenshot_b64(page) -> str:
     """Take a compressed screenshot and return as base64 JPEG (smaller = faster API)."""
-    png_bytes = page.screenshot(type="jpeg", quality=60, scale="css")
-    return base64.b64encode(png_bytes).decode()
+    png_bytes = page.screenshot(type="jpeg", quality=50)
+    b64 = base64.b64encode(png_bytes).decode()
+    print(f"[Vision] Screenshot size: {len(png_bytes)//1024}KB / base64: {len(b64)//1024}KB")
+    return b64
 
 
 def _ask_claude_vision(page, instruction: str, step_log: list) -> dict:
@@ -475,7 +477,11 @@ def _ask_claude_vision(page, instruction: str, step_log: list) -> dict:
                 ],
             }],
         )
-        raw = msg.content[0].text.strip()
+        raw = msg.content[0].text.strip() if msg.content else ""
+        print(f"[Vision] Raw response ({len(raw)} chars): {raw[:200]}")
+        if not raw:
+            step_log.append("Claude returned empty response — retrying as wait")
+            return {"action": "wait"}
         raw = re.sub(r"^```(?:json)?\s*", "", raw)
         raw = re.sub(r"\s*```$", "", raw)
         result = json.loads(raw)
@@ -483,7 +489,8 @@ def _ask_claude_vision(page, instruction: str, step_log: list) -> dict:
         return result
     except Exception as exc:
         step_log.append(f"Claude vision error: {exc}")
-        return {"action": "done", "status": "BLOCKED", "notes": f"Claude vision error: {exc}"}
+        print(f"[Vision] Error: {exc}")
+        return {"action": "wait"}  # retry rather than immediately blocking
 
 
 def step7_execute_tc001(test_cases: list, ticket_key: str):
