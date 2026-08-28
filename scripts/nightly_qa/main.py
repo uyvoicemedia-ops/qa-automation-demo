@@ -2,16 +2,17 @@
 """
 Nightly QA Workflow  —  scripts/nightly_qa/main.py
 Mirrors the 9-step workflow originally designed for Claude Cowork.
- 
+
 Env vars required (set as GitHub Secrets):
   JIRA_EMAIL, JIRA_TOKEN, ANTHROPIC_API_KEY,
   GITHUB_TOKEN, QA_USERNAME, QA_PASSWORD
- 
+
 Optional:
   SLACK_BOT_TOKEN  (DM notification skipped if not set)
   QA_URL           (defaults to https://qa-test-company.i6clouds.com/dp#/dashboard)
 """
- 
+
+import base64
 import json
 import os
 import re
@@ -20,14 +21,14 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
- 
+
 import anthropic
 import openpyxl
 import requests
 from openpyxl.styles import Alignment, Font, PatternFill
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
- 
+
 # ── Config ───────────────────────────────────────────────────────────────────
 JIRA_BASE         = "https://claudeqa.atlassian.net"
 JIRA_EMAIL        = os.environ["JIRA_EMAIL"]
@@ -40,12 +41,12 @@ GITHUB_TOKEN      = os.environ.get("GITHUB_TOKEN", "")
 QA_URL      = os.environ.get("QA_URL", "https://qa-test-company.i6clouds.com/dp#/dashboard")
 QA_USERNAME = os.environ.get("QA_USERNAME") or os.environ.get("QA_DEFAULT_USERNAME", "")
 QA_PASSWORD = os.environ.get("QA_PASSWORD") or os.environ.get("QA_DEFAULT_PASSWORD", "")
- 
+
 TODAY       = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 DEDUP_PATH  = Path("qa_processed_tickets.json")
 OUTPUT_DIR  = Path("qa_outputs")
 OUTPUT_DIR.mkdir(exist_ok=True)
- 
+
 jira_auth    = (JIRA_EMAIL, JIRA_TOKEN)
 jira_headers = {"Accept": "application/json", "Content-Type": "application/json"}
 _ai_extra_headers = {}
@@ -53,8 +54,8 @@ _workspace_id = os.environ.get("ANTHROPIC_WORKSPACE_ID", "")
 if _workspace_id:
     _ai_extra_headers["anthropic-workspace-id"] = _workspace_id
 ai_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, default_headers=_ai_extra_headers)
- 
- 
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 0  —  Deduplication
 # ─────────────────────────────────────────────────────────────────────────────
@@ -65,8 +66,8 @@ def step0_dedup():
     processed_keys = {e["ticket_key"] for e in data.get("processed", [])}
     print(f"[Step 0] Previously processed: {processed_keys or 'none'}")
     return data, processed_keys
- 
- 
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 1  —  Fetch first unprocessed Pending QA ticket
 # ─────────────────────────────────────────────────────────────────────────────
@@ -90,13 +91,13 @@ def step1_get_ticket(processed_keys: set):
     else:
         print(f"[Step 1] Diagnostic fetch failed: {diag_resp.status_code}")
         all_issues = []
- 
+
     # ── Find first ticket whose status contains "pending" (case-insensitive) ──
     PENDING_KEYWORDS = ["pending qa", "pending", "ready for qa", "qa pending", "awaiting qa"]
- 
+
     ticket   = None
     fallback = None
- 
+
     for issue in all_issues:
         status_lower = issue["fields"]["status"]["name"].lower()
         if any(kw in status_lower for kw in PENDING_KEYWORDS):
@@ -105,16 +106,16 @@ def step1_get_ticket(processed_keys: set):
                 break
             elif fallback is None:
                 fallback = issue
- 
+
     # If everything was processed, re-run the oldest matching ticket
     if ticket is None and fallback is not None:
         ticket = fallback
         print(f"[Step 1] All matching tickets previously processed — re-running: {ticket['key']}")
- 
+
     if ticket is None:
         print("[Step 1] No Pending QA tickets found (checked all statuses above).")
         return None
- 
+
     # Re-fetch with full fields for the selected ticket
     full_resp = requests.post(
         f"{JIRA_BASE}/rest/api/3/search/jql",
@@ -130,11 +131,11 @@ def step1_get_ticket(processed_keys: set):
         full_issues = full_resp.json().get("issues", [])
         if full_issues:
             ticket = full_issues[0]
- 
+
     print(f"[Step 1] Selected: {ticket['key']} — {ticket['fields']['summary']}")
     return ticket
- 
- 
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 2  —  Parent ticket → branch name via GitHub API
 # ─────────────────────────────────────────────────────────────────────────────
@@ -143,10 +144,10 @@ def step2_get_branch(ticket) -> tuple[Optional[str], Optional[str]]:
     if not parent:
         print("[Step 2] No parent ticket — skipping branch lookup.")
         return None, None
- 
+
     parent_key = parent["key"]
     print(f"[Step 2] Parent: {parent_key}")
- 
+
     resp = requests.get(
         f"{JIRA_BASE}/rest/api/3/issue/{parent_key}/remotelink",
         auth=jira_auth,
@@ -154,12 +155,12 @@ def step2_get_branch(ticket) -> tuple[Optional[str], Optional[str]]:
     )
     resp.raise_for_status()
     links = resp.json()
- 
+
     pr_links = [l for l in links if "github.com" in l.get("object", {}).get("url", "")]
     if not pr_links:
         print("[Step 2] No GitHub PR links on parent ticket.")
         return parent_key, None
- 
+
     # Prefer the feature/fix PR over sync/chore PRs
     chosen_url = None
     for link in pr_links:
@@ -170,16 +171,16 @@ def step2_get_branch(ticket) -> tuple[Optional[str], Optional[str]]:
             break
     if not chosen_url:
         chosen_url = pr_links[0]["object"]["url"]
- 
+
     pr_match   = re.search(r"/pull/(\d+)", chosen_url)
     repo_match = re.search(r"github\.com/([^/]+/[^/]+)/pull", chosen_url)
     if not pr_match or not repo_match:
         print(f"[Step 2] Could not parse PR URL: {chosen_url}")
         return parent_key, None
- 
+
     pr_number = pr_match.group(1)
     repo      = repo_match.group(1)
- 
+
     gh_resp = requests.get(
         f"https://api.github.com/repos/{repo}/pulls/{pr_number}",
         headers={
@@ -192,8 +193,8 @@ def step2_get_branch(ticket) -> tuple[Optional[str], Optional[str]]:
     branch = gh_resp.json()["head"]["ref"]
     print(f"[Step 2] Branch: {branch}")
     return parent_key, branch
- 
- 
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 3  —  Checkout branch
 # ─────────────────────────────────────────────────────────────────────────────
@@ -201,26 +202,26 @@ def step3_checkout(branch: str) -> bool:
     if not branch:
         print("[Step 3] No branch to checkout — skipping.")
         return False
- 
+
     def run(cmd):
         return subprocess.run(cmd, shell=True, capture_output=True, text=True)
- 
+
     r = run(f"git fetch origin {branch}")
     if r.returncode != 0:
         print(f"[Step 3] git fetch failed: {r.stderr.strip()}")
         return False
- 
+
     r = run(f"git checkout {branch}")
     if r.returncode != 0:
         r = run(f"git checkout -b {branch} origin/{branch}")
     if r.returncode != 0:
         print(f"[Step 3] git checkout failed: {r.stderr.strip()}")
         return False
- 
+
     print(f"[Step 3] Checked out: {branch}")
     return True
- 
- 
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 4  —  Code analysis via Claude Haiku
 # ─────────────────────────────────────────────────────────────────────────────
@@ -232,11 +233,11 @@ def step4_analyse_code(branch: Optional[str]) -> tuple[str, list[str]]:
     )
     result = subprocess.run(diff_cmd, shell=True, capture_output=True, text=True)
     changed_files = [f for f in result.stdout.strip().splitlines() if f]
- 
+
     if not changed_files:
         print("[Step 4] No changed files detected — skipping AI analysis.")
         return "No code changes detected.", changed_files
- 
+
     # Read a sample of changed file contents (up to ~4000 chars total)
     snippets    = []
     total_chars = 0
@@ -250,9 +251,9 @@ def step4_analyse_code(branch: Optional[str]) -> tuple[str, list[str]]:
                 break
         except Exception:
             snippets.append(f"### {filepath}\n(could not read file)")
- 
+
     code_context = "\n\n".join(snippets)
- 
+
     prompt = (
         "You are a senior QA engineer reviewing code changes for a software release.\n\n"
         f"The following files were changed in branch '{branch or 'unknown'}':\n"
@@ -263,7 +264,7 @@ def step4_analyse_code(branch: Optional[str]) -> tuple[str, list[str]]:
         "should pay special attention to. Focus on: data mutations, auth/permission changes, "
         "UI regressions, and any patterns that could cause silent failures."
     )
- 
+
     try:
         message = ai_client.messages.create(
             model="claude-haiku-4-5",
@@ -275,10 +276,10 @@ def step4_analyse_code(branch: Optional[str]) -> tuple[str, list[str]]:
     except Exception as exc:
         risk_summary = f"AI analysis unavailable: {exc}"
         print(f"[Step 4] AI analysis failed: {exc}")
- 
+
     return risk_summary, changed_files
- 
- 
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 5  —  Generate test plan via Claude Sonnet
 # ─────────────────────────────────────────────────────────────────────────────
@@ -295,7 +296,7 @@ def step5_write_test_plan(ticket, risk_summary: str) -> list[dict]:
     elif isinstance(desc_field, str):
         description = desc_field
     description = description.strip()[:1000]
- 
+
     prompt = (
         "You are a senior QA engineer. Based on the ticket below, generate exactly 5 test cases.\n\n"
         f"Ticket: {ticket['key']}\n"
@@ -312,7 +313,7 @@ def step5_write_test_plan(ticket, risk_summary: str) -> list[dict]:
         "(4) regression on existing functionality, (5) permission/feature-flag check.\n"
         "Return ONLY valid JSON — no markdown, no explanation."
     )
- 
+
     try:
         message = ai_client.messages.create(
             model="claude-sonnet-4-6",
@@ -366,27 +367,27 @@ def step5_write_test_plan(ticket, risk_summary: str) -> list[dict]:
                 "expected_result": "Feature is not accessible or is hidden for users without the flag.",
             },
         ]
- 
+
     return test_cases
- 
- 
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 6  —  Create Excel file
 # ─────────────────────────────────────────────────────────────────────────────
 def step6_create_excel(ticket_key: str, test_cases: list) -> tuple[Path, str]:
     filename = f"QA_{ticket_key}_{TODAY}.xlsx"
     filepath = OUTPUT_DIR / filename
- 
+
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Test Cases"
- 
+
     HEADERS    = [
         "TC ID", "Title", "Preconditions", "Steps",
         "Expected Result", "Actual Result", "Status", "Notes", "Screenshot",
     ]
     COL_WIDTHS = [10, 35, 40, 65, 45, 40, 12, 30, 22]
- 
+
     header_fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
     header_font = Font(bold=True, color="FFFFFF", size=11)
     for col, (header, width) in enumerate(zip(HEADERS, COL_WIDTHS), 1):
@@ -395,10 +396,10 @@ def step6_create_excel(ticket_key: str, test_cases: list) -> tuple[Path, str]:
         cell.font = header_font
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         ws.column_dimensions[openpyxl.utils.get_column_letter(col)].width = width
- 
+
     ws.row_dimensions[1].height = 22
     alt_fill = PatternFill(start_color="DCE6F1", end_color="DCE6F1", fill_type="solid")
- 
+
     for row_idx, tc in enumerate(test_cases, 2):
         values = [
             tc.get("id", f"TC-{row_idx - 1:03d}"),
@@ -417,134 +418,186 @@ def step6_create_excel(ticket_key: str, test_cases: list) -> tuple[Path, str]:
             cell.alignment = Alignment(wrap_text=True, vertical="top")
             if row_fill:
                 cell.fill = row_fill
- 
+
     ws.freeze_panes = "A2"
     wb.save(filepath)
     print(f"[Step 6] Excel created: {filepath}")
     return filepath, filename
- 
- 
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 7  —  Execute TC-001 via headless Playwright
+# STEP 7  —  Execute TC-001 via Claude Vision + Playwright (AI-driven)
 # ─────────────────────────────────────────────────────────────────────────────
+def _screenshot_b64(page) -> str:
+    """Take a screenshot and return it as base64 PNG."""
+    return base64.b64encode(page.screenshot()).decode()
+
+
+def _ask_claude_vision(page, instruction: str, step_log: list) -> dict:
+    """
+    Send the current screenshot + instruction to Claude vision.
+    Returns a dict: {"action": "fill|click|wait|done", ...}
+    """
+    img_b64 = _screenshot_b64(page)
+    prompt = (
+        f"{instruction}\n\n"
+        "Look at the screenshot and return the NEXT single action as JSON only.\n"
+        "Valid actions:\n"
+        '  {"action":"fill","selector":"css_selector","value":"text_to_type"}\n'
+        '  {"action":"click","selector":"css_selector"}\n'
+        '  {"action":"wait"}   — page is loading, wait and retry\n'
+        '  {"action":"done","status":"PASS","notes":"what you observed"}\n'
+        '  {"action":"done","status":"FAIL","notes":"what went wrong"}\n'
+        '  {"action":"done","status":"BLOCKED","notes":"why blocked"}\n'
+        "Return ONLY valid JSON — no markdown, no explanation."
+    )
+    try:
+        msg = ai_client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=256,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_b64}},
+                    {"type": "text",  "text": prompt},
+                ],
+            }],
+        )
+        raw = msg.content[0].text.strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        result = json.loads(raw)
+        step_log.append(f"Claude → {result}")
+        return result
+    except Exception as exc:
+        step_log.append(f"Claude vision error: {exc}")
+        return {"action": "done", "status": "BLOCKED", "notes": f"Claude vision error: {exc}"}
+
+
 def step7_execute_tc001(test_cases: list, ticket_key: str):
     screenshot_filename = f"screenshot_TC001_{ticket_key}.png"
     screenshot_path     = OUTPUT_DIR / screenshot_filename
- 
+
     if not test_cases:
         return "BLOCKED", "No test cases were generated.", "", screenshot_path, screenshot_filename
- 
-    actual_result = ""
-    status        = "BLOCKED"
-    notes         = ""
- 
+
+    tc        = test_cases[0]
+    tc_steps  = tc.get("steps", "Navigate and verify the feature works as expected.")
+    step_log  = []
+    status    = "BLOCKED"
+    notes     = ""
+
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-            context = browser.new_context(
-                viewport={"width": 1280, "height": 800},
-                ignore_https_errors=True,
-            )
-            page = context.new_page()
- 
+            page    = browser.new_page(viewport={"width": 1280, "height": 800}, ignore_https_errors=True)
+
+            print(f"[Step 7] Navigating to QA environment: {QA_URL}")
             page.goto(QA_URL, timeout=30_000)
             page.wait_for_load_state("networkidle", timeout=20_000)
- 
-            if QA_USERNAME and QA_PASSWORD:
-                # Fill username — try all common selectors
-                username_selectors = [
-                    "input[type='text']",
-                    "input[type='email']",
-                    "input[name='email']",
-                    "input[name='username']",
-                    "#email",
-                    "#username",
-                ]
-                for sel in username_selectors:
-                    try:
-                        page.fill(sel, QA_USERNAME, timeout=3_000)
-                        print(f"[Step 7] Username filled via: {sel}")
-                        break
-                    except Exception:
-                        pass
- 
-                # Fill password
-                password_selectors = [
-                    "input[type='password']",
-                    "input[name='password']",
-                    "#password",
-                ]
-                for sel in password_selectors:
-                    try:
-                        page.fill(sel, QA_PASSWORD, timeout=3_000)
-                        print(f"[Step 7] Password filled via: {sel}")
-                        break
-                    except Exception:
-                        pass
- 
-                # Submit
-                submit_selectors = [
-                    "button[type='submit']",
-                    "input[type='submit']",
-                    "button:has-text('Login')",
-                    "button:has-text('Log in')",
-                    "button:has-text('Sign in')",
-                ]
-                for sel in submit_selectors:
-                    try:
-                        page.click(sel, timeout=3_000)
-                        page.wait_for_load_state("networkidle", timeout=15_000)
-                        print(f"[Step 7] Submit clicked via: {sel}")
-                        break
-                    except Exception:
-                        pass
- 
-            page.screenshot(path=str(screenshot_path), full_page=False)
- 
-            current_url   = page.url
-            page_title    = page.title()
-            actual_result = f"Navigated to: {current_url}\nPage title: {page_title}"
- 
-            # Detect login failure: still on login page or no hash route loaded
-            page_text = page.inner_text("body")
-            login_still_visible = (
-                any(kw in current_url.lower() for kw in ("login", "sign-in", "signin", "auth"))
-                or "forgotten your password" in page_text.lower()
-                or ("email/username" in page_text.lower() and "password" in page_text.lower())
+
+            # ── Phase 1: Login ────────────────────────────────────────────────
+            login_instruction = (
+                f"You are a QA automation agent logging into a web application.\n"
+                f"Username: {QA_USERNAME}\n"
+                f"Password: (fill the password field with the actual password — use selector only)\n\n"
+                "If you see a login form, fill the username/email field and password field, "
+                "then click the login/submit button.\n"
+                "If you are already logged in (dashboard visible), return done with PASS."
             )
-            if login_still_visible:
-                status = "BLOCKED"
-                notes  = (
-                    "Could not log in to QA environment — verify QA_USERNAME and "
-                    "QA_PASSWORD secrets are set correctly in GitHub."
-                )
+
+            for i in range(8):  # up to 8 login steps
+                action = _ask_claude_vision(page, login_instruction, step_log)
+                print(f"[Step 7] Login step {i+1}: {action}")
+
+                if action["action"] == "done":
+                    if action["status"] == "PASS":
+                        print("[Step 7] Claude confirmed: logged in.")
+                    else:
+                        status = action["status"]
+                        notes  = action.get("notes", "")
+                    break
+
+                elif action["action"] == "fill":
+                    sel = action.get("selector", "")
+                    val = action.get("value", "")
+                    # Substitute password placeholder if Claude used the username value for password
+                    if "password" in sel.lower() or action.get("field_type") == "password":
+                        val = QA_PASSWORD
+                    try:
+                        page.fill(sel, val, timeout=5_000)
+                    except Exception as e:
+                        step_log.append(f"fill failed ({sel}): {e}")
+
+                elif action["action"] == "click":
+                    try:
+                        page.click(action.get("selector", ""), timeout=5_000)
+                        page.wait_for_load_state("networkidle", timeout=15_000)
+                    except Exception as e:
+                        step_log.append(f"click failed: {e}")
+
+                elif action["action"] == "wait":
+                    page.wait_for_timeout(2_000)
+
+            # ── Phase 2: Execute TC-001 steps ─────────────────────────────────
+            test_instruction = (
+                f"You are a QA automation agent executing this test case:\n\n"
+                f"TC-001: {tc.get('title', '')}\n"
+                f"Steps:\n{tc_steps}\n\n"
+                "Execute the next step. If all steps are complete, assess the result and return done."
+            )
+
+            for i in range(12):  # up to 12 test steps
+                action = _ask_claude_vision(page, test_instruction, step_log)
+                print(f"[Step 7] Test step {i+1}: {action}")
+
+                if action["action"] == "done":
+                    status = action.get("status", "BLOCKED")
+                    notes  = action.get("notes", "")
+                    break
+
+                elif action["action"] == "fill":
+                    try:
+                        page.fill(action.get("selector", ""), action.get("value", ""), timeout=5_000)
+                    except Exception as e:
+                        step_log.append(f"fill failed: {e}")
+
+                elif action["action"] == "click":
+                    try:
+                        page.click(action.get("selector", ""), timeout=5_000)
+                        page.wait_for_load_state("networkidle", timeout=10_000)
+                    except Exception as e:
+                        step_log.append(f"click failed: {e}")
+
+                elif action["action"] == "wait":
+                    page.wait_for_timeout(2_000)
             else:
-                status = "PASS"
-                notes  = (
-                    "QA environment is accessible and login succeeded. "
-                    "TC-001 preconditions confirmed. Full step-by-step execution "
-                    "requires a human tester following the Steps column."
-                )
- 
+                # Loop exhausted without done
+                status = "BLOCKED"
+                notes  = "Max steps reached without a conclusive result."
+
+            # Final screenshot
+            page.screenshot(path=str(screenshot_path), full_page=False)
+            actual_result = "\n".join(step_log[-10:])  # last 10 log entries
             browser.close()
- 
+
     except PlaywrightTimeoutError as exc:
-        actual_result = f"Timeout reaching QA URL: {exc}"
+        actual_result = f"Timeout: {exc}"
         status        = "BLOCKED"
         notes         = "QA URL timed out — check network/VPN requirements."
         screenshot_path.write_bytes(b"")
- 
+
     except Exception as exc:
         actual_result = f"Unexpected error: {exc}"
         status        = "BLOCKED"
         notes         = str(exc)
         if not screenshot_path.exists():
             screenshot_path.write_bytes(b"")
- 
-    print(f"[Step 7] TC-001: {status}")
+
+    print(f"[Step 7] TC-001: {status} — {notes[:80]}")
     return status, actual_result, notes, screenshot_path, screenshot_filename
- 
- 
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 8  —  Update Excel with TC-001 results
 # ─────────────────────────────────────────────────────────────────────────────
@@ -561,10 +614,10 @@ def step8_update_excel(
         "BLOCKED": ("FFEB9C", "9C5700"),
     }
     bg, fg = colour_map.get(status, ("FFFFFF", "000000"))
- 
+
     wb = openpyxl.load_workbook(excel_path)
     ws = wb.active
- 
+
     ws.cell(row=2, column=6, value=actual_result).alignment   = Alignment(wrap_text=True, vertical="top")
     status_cell = ws.cell(row=2, column=7, value=status)
     status_cell.fill      = PatternFill(start_color=bg, end_color=bg, fill_type="solid")
@@ -572,11 +625,11 @@ def step8_update_excel(
     status_cell.alignment = Alignment(horizontal="center", vertical="center")
     ws.cell(row=2, column=8, value=notes).alignment           = Alignment(wrap_text=True, vertical="top")
     ws.cell(row=2, column=9, value=screenshot_filename)
- 
+
     wb.save(excel_path)
     print("[Step 8] Excel updated with TC-001 results.")
- 
- 
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 9a  —  Update dedup log
 # ─────────────────────────────────────────────────────────────────────────────
@@ -592,8 +645,8 @@ def step9a_update_dedup(dedup_data: dict, ticket, excel_filename: str, tc001_sta
     )
     DEDUP_PATH.write_text(json.dumps(dedup_data, indent=2))
     print(f"[Step 9a] Dedup log updated — {ticket['key']} marked processed.")
- 
- 
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 9c  —  Slack DM (optional — skipped if SLACK_BOT_TOKEN not set)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -602,13 +655,13 @@ def step9c_slack(ticket, branch: Optional[str], tc001_status: str, excel_filenam
     if not token:
         print("[Step 9c] SLACK_BOT_TOKEN not set — skipping Slack notification.")
         return
- 
+
     emoji         = {"PASS": "✅", "FAIL": "❌", "BLOCKED": "⚠️"}.get(tc001_status, "⚠️")
     run_url       = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
     repo          = os.environ.get("GITHUB_REPOSITORY", "")
     run_id        = os.environ.get("GITHUB_RUN_ID", "")
     artifacts_url = f"{run_url}/{repo}/actions/runs/{run_id}" if run_id else "GitHub Actions"
- 
+
     text = (
         f"*Nightly QA Run — {TODAY}*\n"
         f"• *Ticket:* <{JIRA_BASE}/browse/{ticket['key']}|{ticket['key']}>"
@@ -620,7 +673,7 @@ def step9c_slack(ticket, branch: Optional[str], tc001_status: str, excel_filenam
         f"\n"
         f"💳 Token balance check: https://console.anthropic.com/settings/usage"
     )
- 
+
     resp = requests.post(
         "https://slack.com/api/chat.postMessage",
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
@@ -631,15 +684,15 @@ def step9c_slack(ticket, branch: Optional[str], tc001_status: str, excel_filenam
         print("[Step 9c] Slack DM sent.")
     else:
         print(f"[Step 9c] Slack error: {data.get('error')} — {data}")
- 
- 
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # NO-TICKETS path  —  Board screenshot + Excel + Slack proof
 # ─────────────────────────────────────────────────────────────────────────────
 def take_board_screenshot() -> Optional[Path]:
     """Fetch all SCRUM tickets via Jira API, render as HTML Kanban board, screenshot it."""
     screenshot_path = OUTPUT_DIR / f"jira_board_{TODAY}.png"
- 
+
     # ── Fetch all tickets ─────────────────────────────────────────────────────
     try:
         resp = requests.post(
@@ -657,7 +710,7 @@ def take_board_screenshot() -> Optional[Path]:
     except Exception as exc:
         print(f"[Board screenshot] Jira fetch failed: {exc}")
         return None
- 
+
     # ── Group by status ───────────────────────────────────────────────────────
     STATUS_ORDER = ["In Progress", "In Review", "Pending QA", "QA Testing", "Done"]
     from collections import defaultdict, OrderedDict
@@ -670,7 +723,7 @@ def take_board_screenshot() -> Optional[Path]:
             columns[status] = []
         assignee = (issue["fields"].get("assignee") or {}).get("displayName", "Unassigned")
         columns[status].append({"key": issue["key"], "summary": issue["fields"]["summary"], "assignee": assignee})
- 
+
     # ── Build HTML board ──────────────────────────────────────────────────────
     STATUS_COLORS = {
         "In Progress":  ("#E3F2FD", "#1565C0"),
@@ -679,7 +732,7 @@ def take_board_screenshot() -> Optional[Path]:
         "QA Testing":   ("#F3E5F5", "#6A1B9A"),
         "Done":         ("#E8F5E9", "#2E7D32"),
     }
- 
+
     cards_html = ""
     for status, tickets in columns.items():
         bg, fg = STATUS_COLORS.get(status, ("#F5F5F5", "#333"))
@@ -692,7 +745,7 @@ def take_board_screenshot() -> Optional[Path]:
             f'</div>'
             for t in tickets
         ) or '<div style="font-size:12px;color:#aaa;text-align:center;padding:16px;">Empty</div>'
- 
+
         count = len(tickets)
         cards_html += (
             f'<div style="min-width:220px;max-width:240px;background:{bg};border-radius:8px;padding:12px;">'
@@ -703,7 +756,7 @@ def take_board_screenshot() -> Optional[Path]:
             f'{card_items}'
             f'</div>'
         )
- 
+
     html = f"""<!DOCTYPE html><html><body style="margin:0;padding:24px;
 background:#F4F5F7;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
 <div style="margin-bottom:16px;">
@@ -712,10 +765,10 @@ background:#F4F5F7;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-
 </div>
 <div style="display:flex;gap:12px;align-items:flex-start;">{cards_html}</div>
 </body></html>"""
- 
+
     html_path = OUTPUT_DIR / f"board_{TODAY}.html"
     html_path.write_text(html, encoding="utf-8")
- 
+
     # ── Playwright screenshot ─────────────────────────────────────────────────
     try:
         with sync_playwright() as p:
@@ -730,17 +783,17 @@ background:#F4F5F7;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-
     except Exception as exc:
         print(f"[Board screenshot] Playwright failed: {exc}")
         return None
- 
- 
+
+
 def slack_upload_file(token: str, filepath: Path, channel: str, comment: str) -> bool:
     """Upload a file to Slack using the current (post-2024) 3-step API."""
     if not filepath.exists() or filepath.stat().st_size == 0:
         print(f"[Slack upload] File missing or empty: {filepath}")
         return False
- 
+
     file_size = filepath.stat().st_size
     print(f"[Slack upload] Uploading '{filepath.name}' ({file_size} bytes)…")
- 
+
     # Step 1 — get upload URL
     r1 = requests.post(
         "https://slack.com/api/files.getUploadURLExternal",
@@ -755,7 +808,7 @@ def slack_upload_file(token: str, filepath: Path, channel: str, comment: str) ->
             print("[Slack upload] ⚠️  Your Slack bot is missing the 'files:write' scope.")
             print("  Fix: go to api.slack.com/apps → OAuth & Permissions → Scopes → add 'files:write' → reinstall app.")
         return False
- 
+
     # Step 2 — PUT file bytes to the presigned URL
     with open(filepath, "rb") as fh:
         r2 = requests.put(r1d["upload_url"], data=fh,
@@ -763,7 +816,7 @@ def slack_upload_file(token: str, filepath: Path, channel: str, comment: str) ->
     if r2.status_code not in (200, 204):
         print(f"[Slack upload] PUT to upload_url failed: HTTP {r2.status_code} — {r2.text[:200]}")
         return False
- 
+
     # Step 3 — complete & share in channel
     r3 = requests.post(
         "https://slack.com/api/files.completeUploadExternal",
@@ -780,19 +833,19 @@ def slack_upload_file(token: str, filepath: Path, channel: str, comment: str) ->
         return True
     print(f"[Slack upload] completeUploadExternal failed: {r3d.get('error')} — {r3d}")
     return False
- 
- 
+
+
 def no_tickets_excel() -> tuple[Path, str]:
     filename = f"QA_NO_TICKETS_{TODAY}.xlsx"
     filepath = OUTPUT_DIR / filename
- 
+
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "QA Status"
- 
+
     header_fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
     header_font = Font(bold=True, color="FFFFFF", size=11)
- 
+
     headers = ["Date", "Project", "Status", "Notes"]
     widths  = [18, 20, 30, 60]
     for col, (h, w) in enumerate(zip(headers, widths), 1):
@@ -801,7 +854,7 @@ def no_tickets_excel() -> tuple[Path, str]:
         cell.font = header_font
         cell.alignment = Alignment(horizontal="center", vertical="center")
         ws.column_dimensions[openpyxl.utils.get_column_letter(col)].width = w
- 
+
     green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
     for col, val in enumerate([
         TODAY, "SCRUM", "✅ No Pending QA tickets",
@@ -811,25 +864,25 @@ def no_tickets_excel() -> tuple[Path, str]:
         cell = ws.cell(row=2, column=col, value=val)
         cell.fill = green_fill
         cell.alignment = Alignment(wrap_text=True, vertical="top")
- 
+
     ws.row_dimensions[2].height = 40
     ws.freeze_panes = "A2"
     wb.save(filepath)
     print(f"[No-tickets] Excel created: {filepath}")
     return filepath, filename
- 
- 
+
+
 def no_tickets_slack(excel_filename: str, board_screenshot: Optional[Path]):
     token = os.environ.get("SLACK_BOT_TOKEN", "")
     if not token:
         print("[No-tickets] SLACK_BOT_TOKEN not set — skipping Slack notification.")
         return
- 
+
     run_url       = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
     repo          = os.environ.get("GITHUB_REPOSITORY", "")
     run_id        = os.environ.get("GITHUB_RUN_ID", "")
     artifacts_url = f"{run_url}/{repo}/actions/runs/{run_id}" if run_id else "GitHub Actions"
- 
+
     text = (
         f"*Nightly QA Run — {TODAY}*\n"
         f"✅ *No Pending QA tickets found* — nothing to test tonight.\n"
@@ -838,7 +891,7 @@ def no_tickets_slack(excel_filename: str, board_screenshot: Optional[Path]):
         f"• *Proof Excel:* <{artifacts_url}|Download from GitHub Actions artifacts>"
         f" → `{excel_filename}`"
     )
- 
+
     resp = requests.post(
         "https://slack.com/api/chat.postMessage",
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
@@ -849,25 +902,25 @@ def no_tickets_slack(excel_filename: str, board_screenshot: Optional[Path]):
         print("[No-tickets] Slack DM sent.")
     else:
         print(f"[No-tickets] Slack error: {data.get('error')} — {data}")
- 
+
     # Upload board screenshot directly into the DM
     if board_screenshot and board_screenshot.exists() and board_screenshot.stat().st_size > 0:
         slack_upload_file(
             token, board_screenshot, SLACK_DM_CHANNEL,
             f"📋 Jira SCRUM board snapshot — {TODAY}"
         )
- 
- 
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
     sep = "=" * 62
     print(f"\n{sep}\n  Nightly QA Workflow — {TODAY}\n{sep}\n")
- 
+
     dedup_data, processed_keys  = step0_dedup()
     ticket                      = step1_get_ticket(processed_keys)
- 
+
     # ── No tickets path ───────────────────────────────────────────────────────
     if ticket is None:
         board_screenshot      = take_board_screenshot()
@@ -875,29 +928,26 @@ def main():
         no_tickets_slack(excel_filename, board_screenshot)
         print(f"\n{sep}\n  Done. No Pending QA tickets found.\n{sep}\n")
         return
- 
+
     # ── Normal path ───────────────────────────────────────────────────────────
     parent_key, branch          = step2_get_branch(ticket)
- 
+
     if branch:
         step3_checkout(branch)
- 
+
     risk_summary, changed_files = step4_analyse_code(branch)
     test_cases                  = step5_write_test_plan(ticket, risk_summary)
     excel_path, excel_filename  = step6_create_excel(ticket["key"], test_cases)
- 
+
     tc_status, actual_result, notes, screenshot_path, screenshot_filename = \
         step7_execute_tc001(test_cases, ticket["key"])
- 
+
     step8_update_excel(excel_path, tc_status, actual_result, notes, screenshot_filename)
     step9a_update_dedup(dedup_data, ticket, excel_filename, tc_status)
     step9c_slack(ticket, branch, tc_status, excel_filename)
- 
+
     print(f"\n{sep}\n  Done. TC-001: {tc_status}\n{sep}\n")
- 
- 
+
+
 if __name__ == "__main__":
     main()
- 
-
-
