@@ -435,8 +435,9 @@ def step6_create_excel(ticket_key: str, test_cases: list) -> tuple[Path, str]:
 # STEP 7  —  Execute TC-001 via Claude Vision + Playwright (AI-driven)
 # ─────────────────────────────────────────────────────────────────────────────
 def _screenshot_b64(page) -> str:
-    """Take a screenshot and return it as base64 PNG."""
-    return base64.b64encode(page.screenshot()).decode()
+    """Take a compressed screenshot and return as base64 JPEG (smaller = faster API)."""
+    png_bytes = page.screenshot(type="jpeg", quality=60, scale="css")
+    return base64.b64encode(png_bytes).decode()
 
 
 def _ask_claude_vision(page, instruction: str, step_log: list) -> dict:
@@ -469,7 +470,7 @@ def _ask_claude_vision(page, instruction: str, step_log: list) -> dict:
             messages=[{
                 "role": "user",
                 "content": [
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_b64}},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
                     {"type": "text",  "text": prompt},
                 ],
             }],
