@@ -451,44 +451,50 @@ def step7_execute_tc001(test_cases: list, ticket_key: str):
             page.wait_for_load_state("networkidle", timeout=20_000)
  
             if QA_USERNAME and QA_PASSWORD:
-                login_selectors = [
-                    ("input[type='email']",    QA_USERNAME),
-                    ("input[name='email']",    QA_USERNAME),
-                    ("input[name='username']", QA_USERNAME),
-                    ("#email",                 QA_USERNAME),
-                    ("#username",              QA_USERNAME),
+                # Fill username — try all common selectors
+                username_selectors = [
+                    "input[type='text']",
+                    "input[type='email']",
+                    "input[name='email']",
+                    "input[name='username']",
+                    "#email",
+                    "#username",
                 ]
+                for sel in username_selectors:
+                    try:
+                        page.fill(sel, QA_USERNAME, timeout=3_000)
+                        print(f"[Step 7] Username filled via: {sel}")
+                        break
+                    except Exception:
+                        pass
+ 
+                # Fill password
                 password_selectors = [
                     "input[type='password']",
                     "input[name='password']",
                     "#password",
                 ]
-                submit_selectors = [
-                    "button[type='submit']",
-                    "input[type='submit']",
-                    "button:has-text('Log in')",
-                    "button:has-text('Login')",
-                    "button:has-text('Sign in')",
-                ]
- 
-                for sel, val in login_selectors:
-                    try:
-                        page.fill(sel, val, timeout=3_000)
-                        break
-                    except Exception:
-                        pass
- 
                 for sel in password_selectors:
                     try:
                         page.fill(sel, QA_PASSWORD, timeout=3_000)
+                        print(f"[Step 7] Password filled via: {sel}")
                         break
                     except Exception:
                         pass
  
+                # Submit
+                submit_selectors = [
+                    "button[type='submit']",
+                    "input[type='submit']",
+                    "button:has-text('Login')",
+                    "button:has-text('Log in')",
+                    "button:has-text('Sign in')",
+                ]
                 for sel in submit_selectors:
                     try:
                         page.click(sel, timeout=3_000)
                         page.wait_for_load_state("networkidle", timeout=15_000)
+                        print(f"[Step 7] Submit clicked via: {sel}")
                         break
                     except Exception:
                         pass
@@ -499,7 +505,14 @@ def step7_execute_tc001(test_cases: list, ticket_key: str):
             page_title    = page.title()
             actual_result = f"Navigated to: {current_url}\nPage title: {page_title}"
  
-            if any(kw in current_url.lower() for kw in ("login", "sign-in", "signin", "auth")):
+            # Detect login failure: still on login page or no hash route loaded
+            page_text = page.inner_text("body")
+            login_still_visible = (
+                any(kw in current_url.lower() for kw in ("login", "sign-in", "signin", "auth"))
+                or "forgotten your password" in page_text.lower()
+                or ("email/username" in page_text.lower() and "password" in page_text.lower())
+            )
+            if login_still_visible:
                 status = "BLOCKED"
                 notes  = (
                     "Could not log in to QA environment — verify QA_USERNAME and "
@@ -885,3 +898,6 @@ def main():
  
 if __name__ == "__main__":
     main()
+ 
+
+
