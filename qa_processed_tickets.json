@@ -384,6 +384,13 @@
       "processed_date": "2026-10-05",
       "excel_file": "QA_SCRUM-1_2026-10-05.xlsx",
       "tc001_status": "BLOCKED"
+    },
+    {
+      "ticket_key": "SCRUM-1",
+      "ticket_summary": "Task 1",
+      "processed_date": "2026-10-06",
+      "excel_file": "QA_SCRUM-1_2026-10-06.xlsx",
+      "tc001_status": "BLOCKED"
     }
   ]
 }
